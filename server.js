@@ -131,10 +131,12 @@ const activeRevalidations = new Set();
 const pendingQueries = new Map();
 let nextTxId = 1;
 
-// Initialize outgoing UDP socket for upstream routing & active health checks
-const udpSocket = dgram.createSocket('udp4');
+// Initialize a pool of 5 outgoing UDP sockets to prevent I/O bottlenecks under load
+const SOCKET_POOL_SIZE = 5;
+const socketPool = [];
+let nextSocketIndex = 0;
 
-udpSocket.on('message', (msg, rinfo) => {
+function handleIncomingUDP(msg, rinfo) {
   if (msg.length < 2) return;
   try {
     const txId = msg.readUInt16BE(0);
@@ -147,22 +149,36 @@ udpSocket.on('message', (msg, rinfo) => {
   } catch (err) {
     console.error('Error handling UDP DNS response:', err);
   }
-});
+}
 
-udpSocket.on('error', (err) => {
-  console.error('UDP socket error:', err);
-});
+for (let i = 0; i < SOCKET_POOL_SIZE; i++) {
+  const sock = dgram.createSocket('udp4');
+  
+  sock.on('message', (msg, rinfo) => {
+    handleIncomingUDP(msg, rinfo);
+  });
+  
+  sock.on('error', (err) => {
+    console.error(`UDP socket pool [${i}] error:`, err);
+  });
+  
+  sock.bind(0, () => {
+    try {
+      sock.setRecvBufferSize(1024 * 1024);
+      sock.setSendBufferSize(1024 * 1024);
+    } catch (err) {
+      console.warn(`Could not set buffer size on socket [${i}]:`, err.message);
+    }
+  });
+  
+  socketPool.push(sock);
+}
 
-// Explicitly bind the UDP socket and expand receive/send buffers to 1MB to prevent packet drops under load
-udpSocket.bind(0, () => {
-  try {
-    udpSocket.setRecvBufferSize(1024 * 1024);
-    udpSocket.setSendBufferSize(1024 * 1024);
-    console.log('UDP Socket buffer sizes successfully expanded to 1MB.');
-  } catch (err) {
-    console.warn('Could not set UDP socket buffer sizes:', err.message);
-  }
-});
+function getSocketFromPool() {
+  const sock = socketPool[nextSocketIndex];
+  nextSocketIndex = (nextSocketIndex + 1) % SOCKET_POOL_SIZE;
+  return sock;
+}
 
 // Unique transaction ID generator
 function getNextTxId() {
@@ -208,7 +224,7 @@ function pingUpstream(ip) {
       timeout
     });
 
-    udpSocket.send(pingPacket, 0, pingPacket.length, 53, ip, (err) => {
+    getSocketFromPool().send(pingPacket, 0, pingPacket.length, 53, ip, (err) => {
       if (err) {
         clearTimeout(timeout);
         pendingQueries.delete(txId);
@@ -273,6 +289,7 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
       return;
     }
 
+    const sock = getSocketFromPool(); // Pick a socket from pool for this query
     const originalTxId = queryBuffer.readUInt16BE(0);
     const myTxId = getNextTxId();
 
@@ -343,7 +360,7 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
     });
 
     // Send query to primary
-    udpSocket.send(upstreamQuery, 0, upstreamQuery.length, 53, primary.ip, (err) => {
+    sock.send(upstreamQuery, 0, upstreamQuery.length, 53, primary.ip, (err) => {
       if (err) {
         if (backupTimer) clearTimeout(backupTimer);
         triggerBackup();
@@ -364,12 +381,11 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
       // Send to remaining candidates
       candidates.forEach(state => {
         if (state.ip !== primary.ip) {
-          udpSocket.send(upstreamQuery, 0, upstreamQuery.length, 53, state.ip, (err) => {
+          sock.send(upstreamQuery, 0, upstreamQuery.length, 53, state.ip, (err) => {
             if (err) {
               state.realErrorsCount++;
               state.penalty = Math.min(1000, state.penalty + 100);
               state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
-              updateCandidates();
             }
           });
         }
@@ -1325,6 +1341,9 @@ const server = http.createServer(async (req, res) => {
     res.end(html);
   }
 });
+
+server.keepAliveTimeout = 65000; // Keep HTTPS connection open for 65 seconds
+server.headersTimeout = 66000;
 
 server.listen(PORT, () => {
   console.log("Antigravity Hyper-Speed DNS Server running on http://localhost:" + PORT);
