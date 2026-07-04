@@ -262,6 +262,7 @@ performHealthChecks().then(() => {
   updateCandidates();
 });
 setInterval(performHealthChecks, 25000);
+setInterval(updateCandidates, 5000); // Update rankings every 5s to keep CPU low
 
 // Perform DNS routing using Dynamic Weighted Load Balancing + Speculative Backup Retry (Dynamic delay)
 function raceDNS(queryBuffer, timeoutMs = 1200) {
@@ -295,7 +296,6 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
         state.penalty = Math.min(1000, state.penalty + 250);
         state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
       });
-      updateCandidates();
 
       reject(new Error('DNS query timeout'));
     }, timeoutMs);
@@ -323,7 +323,6 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
           winner.score = winner.avgLatency + (winner.lossRate * 5) + winner.penalty;
         }
 
-        updateCandidates();
         resolve({ responseBuffer, from });
       },
       reject: (err) => {
@@ -337,7 +336,6 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
           state.penalty = Math.min(1000, state.penalty + 200);
           state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
         });
-        updateCandidates();
 
         reject(err);
       },
@@ -352,9 +350,8 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
       }
     });
 
-    // Dynamic Speculative Backup Delay: wait only 1.3x of primary's latency (min 20ms, max 200ms)
-    // If primary has 6ms ping, we wait only 20ms to backup, ensuring ultra-responsive failover
-    const backupDelay = Math.max(20, Math.min(200, Math.round(primary.avgLatency * 1.3)));
+    // Dynamic Speculative Backup Delay: wait only 1.4x of primary's latency (min 70ms, max 250ms)
+    const backupDelay = Math.max(70, Math.min(250, Math.round(primary.avgLatency * 1.4)));
     
     backupTimer = setTimeout(() => {
       triggerBackup();
@@ -405,7 +402,7 @@ function getMinTTL(dnsPacketObj) {
   if (dnsPacketObj.authorities) dnsPacketObj.authorities.forEach(processRecord);
   if (dnsPacketObj.additionals) dnsPacketObj.additionals.forEach(processRecord);
 
-  if (minTtl <= 0) minTtl = 5;
+  if (minTtl < 60) minTtl = 60; // Enforce minimum TTL of 60 seconds
   if (minTtl > 86400) minTtl = 86400;
   return minTtl;
 }
@@ -1086,9 +1083,10 @@ const server = http.createServer(async (req, res) => {
 <body>
     <div class="container">
         <!-- Latency Warning Banner for Singapore Region Recommendation -->
-        <div id="latency-warning-banner" style="display: none; background: linear-gradient(135deg, #ff453a 0%, #ff9f0a 100%); color: #000; padding: 15px 20px; text-align: center; font-weight: 600; font-size: 0.95rem; border-radius: 12px; margin-bottom: 25px; box-shadow: 0 5px 15px rgba(255, 69, 58, 0.2);">
+        <div id="latency-warning-banner" style="display: none; background: linear-gradient(135deg, #ff453a 0%, #ff9f0a 100%); color: #000; padding: 15px 25px; text-align: center; font-weight: 600; font-size: 0.95rem; border-radius: 12px; margin-bottom: 25px; box-shadow: 0 5px 15px rgba(255, 69, 58, 0.2); position: relative; padding-right: 45px;">
             ⚠️ CẢNH BÁO ĐỘ TRỄ CAO: Kết nối từ thiết bị của bạn đến máy chủ Render hiện tại là <span id="client-latency-val">0</span>ms (ì ạch). 
             Hãy chuyển vùng (region) của Web Service trên Render sang <strong>Singapore (SG)</strong> để tối ưu hóa RTT xuống 30-40ms!
+            <button onclick="dismissBanner()" style="position: absolute; right: 15px; top: 50%; transform: translateY(-50%); background: none; border: none; font-size: 1.4rem; font-weight: bold; cursor: pointer; color: #000; opacity: 0.7; line-height: 1;">&times;</button>
         </div>
 
         <header>
@@ -1214,6 +1212,11 @@ const server = http.createServer(async (req, res) => {
             });
         }
 
+        function dismissBanner() {
+            localStorage.setItem('hideLatencyWarning', 'true');
+            document.getElementById('latency-warning-banner').style.display = 'none';
+        }
+
         async function fetchStats() {
             const startTime = Date.now();
             try {
@@ -1221,10 +1224,12 @@ const server = http.createServer(async (req, res) => {
                 const clientLatency = Date.now() - startTime;
                 const data = await res.json();
                 
-                // Show region warning banner if device-to-server RTT is too high
+                // Show region warning banner if device-to-server RTT is too high and not dismissed
                 const banner = document.getElementById('latency-warning-banner');
                 const latVal = document.getElementById('client-latency-val');
-                if (clientLatency > 120) {
+                const isDismissed = localStorage.getItem('hideLatencyWarning') === 'true';
+                
+                if (clientLatency > 120 && !isDismissed) {
                     banner.style.display = 'block';
                     latVal.innerText = clientLatency;
                 } else {
