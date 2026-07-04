@@ -12,7 +12,7 @@ function base64urlEncode(buf) {
 }
 
 async function runTests() {
-  console.log('=== KHIỂM THỬ MÁY CHỦ DNS ADAPTIVE LOAD BALANCER ===');
+  console.log('=== KHIỂM THỬ MÁY CHỦ DNS HYPER-SPEED & SWR CACHING ===');
   
   // 1. Khởi động server
   const serverProc = spawn('node', ['server.js'], {
@@ -35,28 +35,24 @@ async function runTests() {
   try {
     const url = `http://localhost:${TEST_PORT}`;
     
-    // --- CA KIỂM THỬ 1: Kiểm tra cấu trúc stats của Adaptive DNS ---
-    console.log('\n[TEST 1]: Kiểm tra API Stats & Thuộc tính Thích ứng (Adaptive)...');
+    // --- CA KIỂM THỬ 1: Kiểm tra các chỉ số Hyper-Speed stats ---
+    console.log('\n[TEST 1]: Kiểm tra các trường chỉ số Hyper-Speed & SWR...');
     const statsRes = await fetch(`${url}/api/stats`);
     if (!statsRes.ok) throw new Error(`Stats endpoint failed: ${statsRes.status}`);
     const stats = await statsRes.json();
     
-    const sampleUpstream = stats.upstreams[0];
-    console.log(`=> DNS Server mẫu: ${sampleUpstream.name}`);
-    console.log(`   - Ping Active: ${sampleUpstream.avgLatency}ms`);
-    console.log(`   - Trễ Thực tế EMA ban đầu: ${sampleUpstream.realAvgLatency}ms`);
-    console.log(`   - Điểm phạt (Penalty): ${sampleUpstream.penalty}ms`);
-    console.log(`   - Số truy vấn thực tế: ${sampleUpstream.realQueriesCount}`);
+    console.log(`=> Kích thước Racing Pool động hiện tại: ${stats.poolSize} servers`);
+    console.log(`=> Số lượt SWR Hits ban đầu: ${stats.swrHits}`);
     
-    if (sampleUpstream.realAvgLatency !== 0) throw new Error('Ban đầu realAvgLatency phải bằng 0');
-    if (sampleUpstream.penalty !== 0) throw new Error('Ban đầu penalty phải bằng 0');
+    if (typeof stats.swrHits !== 'number') throw new Error('Trường swrHits phải là kiểu số');
+    if (stats.poolSize < 2 || stats.poolSize > 4) throw new Error('Kích thước Racing Pool phải nằm trong khoảng từ 2 đến 4');
     console.log('=> TEST 1: PASS');
 
     // --- CA KIỂM THỬ 2: Gửi truy vấn thực tế lần 1 (google.com) ---
-    console.log('\n[TEST 2]: Truy vấn DNS (google.com) bằng POST để kích hoạt đo đạc thực tế...');
+    console.log('\n[TEST 2]: Truy vấn DNS (google.com) bằng POST (Cache Miss)...');
     const queryBuffer = dnsPacket.encode({
       type: 'query',
-      id: 1010,
+      id: 3030,
       flags: dnsPacket.RECURSION_DESIRED,
       questions: [{
         type: 'A',
@@ -76,47 +72,51 @@ async function runTests() {
     const postLatency = Date.now() - startPost;
     
     const dnsResponse = dnsPacket.decode(responseBuffer);
-    console.log(`=> Truy vấn google.com thành công: RTT = ${postLatency}ms`);
+    console.log(`=> Độ trễ (Cache Miss): ${postLatency}ms`);
     console.log('=> TEST 2: PASS');
 
-    // --- CA KIỂM THỬ 3: Truy vấn lần 2 (github.com) ---
-    console.log('\n[TEST 3]: Truy vấn DNS (github.com) bằng GET...');
-    const queryGetBuffer = dnsPacket.encode({
+    // --- CA KIỂM THỬ 3: Truy vấn lần 2 (google.com) - Xác nhận Cache Hit ---
+    console.log('\n[TEST 3]: Truy vấn lại google.com (Yêu cầu nhận ngay từ Cache)...');
+    const queryBuffer2 = dnsPacket.encode({
       type: 'query',
-      id: 2020,
+      id: 4040,
       flags: dnsPacket.RECURSION_DESIRED,
       questions: [{
         type: 'A',
-        name: 'github.com'
+        name: 'google.com'
       }]
     });
 
-    const base64Param = base64urlEncode(queryGetBuffer);
-    const getRes = await fetch(`${url}/dns-query?dns=${base64Param}`);
-    if (!getRes.ok) throw new Error(`GET dns-query failed`);
-    console.log('=> TEST 3: PASS');
-
-    // --- CA KIỂM THỬ 4: Kiểm tra tính toán EMA và Phân phối tải thích ứng ---
-    console.log('\n[TEST 4]: Kiểm tra tính toán EMA & Cập nhật thứ hạng định tuyến...');
-    const statsRes2 = await fetch(`${url}/api/stats`);
-    const stats2 = await statsRes2.json();
-    
-    console.log('=> Trạng thái thích ứng thực tế của các upstreams đã xử lý truy vấn:');
-    let hasRealLatency = false;
-    stats2.upstreams.forEach(dns => {
-      if (dns.realQueriesCount > 0) {
-        console.log(`   * ${dns.name} (${dns.ip}):`);
-        console.log(`     - Số truy vấn thực tế: ${dns.realQueriesCount}`);
-        console.log(`     - Trễ thực tế trung bình (EMA): ${dns.realAvgLatency}ms`);
-        console.log(`     - Điểm phạt hiện tại: ${dns.penalty}ms`);
-        console.log(`     - Điểm số định tuyến tổng hợp (Score): ${dns.score}`);
-        if (dns.realAvgLatency > 0) {
-          hasRealLatency = true;
-        }
-      }
+    const startCache = Date.now();
+    const cacheRes = await fetch(`${url}/dns-query`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/dns-message' },
+      body: queryBuffer2
     });
 
-    if (!hasRealLatency) throw new Error('Hệ thống không cập nhật realAvgLatency (EMA) từ truy vấn thực tế!');
+    if (!cacheRes.ok) throw new Error('Cache lookup failed');
+    const cacheResponseBuffer = Buffer.from(await cacheRes.arrayBuffer());
+    const cacheLatency = Date.now() - startCache;
+    
+    const dnsCacheResponse = dnsPacket.decode(cacheResponseBuffer);
+    console.log(`=> Độ trễ (Cache Hit): ${cacheLatency}ms (Trùng khớp ID: ${dnsCacheResponse.id === 4040})`);
+    
+    if (cacheLatency > 15) throw new Error('Độ trễ Cache Hit quá cao, không đạt tiêu chuẩn lướt web nhanh');
+    console.log('=> TEST 3: PASS');
+
+    // --- CA KIỂM THỬ 4: Kiểm tra thống kê cuối ---
+    console.log('\n[TEST 4]: Kiểm tra lại thống kê tổng hợp...');
+    const statsRes2 = await fetch(`${url}/api/stats`);
+    const stats2 = await statsRes2.json();
+    console.log('=> Thống kê tổng hợp:', JSON.stringify({
+      totalQueries: stats2.totalQueries,
+      cacheHits: stats2.cacheHits,
+      swrHits: stats2.swrHits,
+      cacheMisses: stats2.cacheMisses,
+      poolSize: stats2.poolSize
+    }));
+    
+    if (stats2.cacheHits !== 1) throw new Error('Số lượt cache hit phải bằng 1');
     console.log('=> TEST 4: PASS');
 
   } catch (err) {

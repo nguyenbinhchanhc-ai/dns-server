@@ -22,51 +22,84 @@ const UPSTREAMS = [
 const stats = {
   totalQueries: 0,
   cacheHits: 0,
+  swrHits: 0,            // Stale-While-Revalidate hits (0ms latency to client)
   cacheMisses: 0,
   errors: 0,
   totalLatency: 0,
   averageLatency: 0
 };
 
-// Upstream Performance & Health Registry (Adaptive with EMA & Penalty)
+// Upstream Performance & Health Registry
 const upstreamStates = UPSTREAMS.map(dns => ({
   ip: dns.ip,
   name: dns.name,
-  pings: [],              // Last 5 ping latencies for sliding window
+  pings: [],              // Last 5 ping latencies
   successCount: 0,
   failCount: 0,
-  avgLatency: 120,        // Active ping latency average
+  avgLatency: 120,
   lossRate: 0,
   
-  // Real-world client query performance
   realAvgLatency: 0,      // Exponential Moving Average (EMA) of real queries
-  realQueriesCount: 0,    // Total real queries sent
-  realErrorsCount: 0,     // Total real query errors/timeouts
+  realQueriesCount: 0,
+  realErrorsCount: 0,
   
   penalty: 0,             // Active penalty (ms) for errors, decays over time
-  score: 120,             // Routing score = avgLatency + lossRate*5 + penalty (lower is better)
+  score: 120,             // Score = avgLatency + lossRate*5 + penalty
   routedQueries: 0,       // Total client queries won by this upstream
-  status: 'Healthy'       // 'Healthy', 'Warning', 'Offline'
+  status: 'Healthy'
 }));
 
-// Pre-sorted active candidates for O(1) routing
+// Pre-sorted active candidates & dynamic pool size
 let activeCandidates = [];
+let currentPoolSize = 2;
 
 function updateCandidates() {
   const sorted = [...upstreamStates]
     .filter(s => s.status !== 'Offline')
     .sort((a, b) => a.score - b.score);
     
-  activeCandidates = sorted.length >= 2 
-    ? sorted.slice(0, 2) 
-    : (sorted.length > 0 ? sorted : upstreamStates.slice(0, 2));
+  if (sorted.length === 0) {
+    activeCandidates = upstreamStates.slice(0, 2);
+    currentPoolSize = 2;
+    return;
+  }
+
+  // Jitter & Quality Aware Dynamic Racing Pool Sizing (2 to 4 servers)
+  let poolSize = 2;
+
+  if (sorted.length >= 3) {
+    const gap1to2 = sorted[1].avgLatency - sorted[0].avgLatency;
+    const gap1to3 = sorted[2].avgLatency - sorted[0].avgLatency;
+    
+    // If the top 3 pings are very close, race 3 servers to find the absolute fastest
+    if (gap1to3 < 20 || gap1to2 < 12) {
+      poolSize = 3;
+    }
+    // If any of the top 3 has packet loss, increase pool size to 3 for redundancy
+    if (sorted[0].lossRate > 0 || sorted[1].lossRate > 0 || sorted[2].lossRate > 0) {
+      poolSize = 3;
+    }
+  }
+
+  if (sorted.length >= 4) {
+    const gap1to4 = sorted[3].avgLatency - sorted[0].avgLatency;
+    const hasWarning = sorted.slice(0, 3).some(s => s.status === 'Warning');
+    
+    // If there's network instability or candidate #4 is also very close, race 4 servers
+    if (hasWarning || gap1to4 < 15) {
+      poolSize = 4;
+    }
+  }
+
+  poolSize = Math.max(2, Math.min(poolSize, sorted.length));
+  currentPoolSize = poolSize;
+  activeCandidates = sorted.slice(0, poolSize);
 }
 
 // In-Memory DNS Cache (Key: name:type:class)
 const cache = new Map();
 
 // Active Pending Upstream Queries (UDP mapping)
-// key: myTxId -> { resolve, reject, timeout, originalTxId }
 const pendingQueries = new Map();
 let nextTxId = 1;
 
@@ -107,7 +140,6 @@ function pingUpstream(ip) {
   return new Promise((resolve) => {
     const txId = getNextTxId();
     
-    // Create standard SOA query for root zone as a small ping packet
     const pingPacket = dnsPacket.encode({
       type: 'query',
       id: txId,
@@ -122,7 +154,7 @@ function pingUpstream(ip) {
     const timeout = setTimeout(() => {
       pendingQueries.delete(txId);
       resolve({ success: false, latency: 1000 });
-    }, 1500); // 1.5 seconds timeout
+    }, 1500);
 
     pendingQueries.set(txId, {
       resolve: () => {
@@ -152,19 +184,17 @@ async function performHealthChecks() {
   await Promise.all(upstreamStates.map(async (state) => {
     const res = await pingUpstream(state.ip);
     
-    // Update sliding window (last 5 results)
     if (res.success) {
       state.pings.push(res.latency);
       state.successCount++;
     } else {
-      state.pings.push(1000); // Penalty latency for packet loss
+      state.pings.push(1000);
       state.failCount++;
     }
     if (state.pings.length > 5) {
       state.pings.shift();
     }
 
-    // Calculations
     const validPings = state.pings.filter(p => p !== 1000);
     state.avgLatency = validPings.length > 0 
       ? Math.round(validPings.reduce((a, b) => a + b, 0) / validPings.length)
@@ -173,13 +203,11 @@ async function performHealthChecks() {
     const lostCount = state.pings.filter(p => p === 1000).length;
     state.lossRate = Math.round((lostCount / state.pings.length) * 100);
 
-    // Decay current penalty by 50% on every active health check tick
+    // Decay penalty by 50% on every active health check tick
     state.penalty = Math.max(0, Math.round(state.penalty * 0.5));
 
-    // Score = avgLatency + packet loss penalty + active penalty
     state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
 
-    // Determine status
     if (state.lossRate >= 60) {
       state.status = 'Offline';
     } else if (state.lossRate >= 20 || state.avgLatency > 250 || state.penalty > 200) {
@@ -198,7 +226,7 @@ performHealthChecks().then(() => {
 });
 setInterval(performHealthChecks, 25000);
 
-// Perform DNS racing on pre-sorted top 2 healthiest servers
+// Perform DNS racing on adaptive candidates
 function raceDNS(queryBuffer, timeoutMs = 3000) {
   return new Promise((resolve, reject) => {
     const candidates = activeCandidates;
@@ -213,10 +241,9 @@ function raceDNS(queryBuffer, timeoutMs = 3000) {
     const timeout = setTimeout(() => {
       pendingQueries.delete(myTxId);
       
-      // Apply timeout penalties to all queried candidates
       candidates.forEach(state => {
         state.realErrorsCount++;
-        state.penalty = Math.min(1000, state.penalty + 250); // Instant 250ms penalty
+        state.penalty = Math.min(1000, state.penalty + 250);
         state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
       });
       updateCandidates();
@@ -232,19 +259,16 @@ function raceDNS(queryBuffer, timeoutMs = 3000) {
         const responseBuffer = Buffer.from(buffer);
         responseBuffer.writeUInt16BE(originalTxId, 0);
         
-        // Track stats & calculate EMA for the winner
         const winner = upstreamStates.find(s => s.ip === from);
         if (winner) {
           winner.routedQueries++;
           
-          // Exponential Moving Average (EMA) with alpha = 0.3
           const alpha = 0.3;
           winner.realAvgLatency = winner.realQueriesCount === 0 
             ? latency 
             : Math.round(alpha * latency + (1 - alpha) * winner.realAvgLatency);
           winner.realQueriesCount++;
           
-          // Reduce penalty slightly for successful real query
           winner.penalty = Math.max(0, winner.penalty - 25);
           winner.score = winner.avgLatency + (winner.lossRate * 5) + winner.penalty;
         }
@@ -256,7 +280,6 @@ function raceDNS(queryBuffer, timeoutMs = 3000) {
         clearTimeout(timeout);
         pendingQueries.delete(myTxId);
         
-        // Apply error penalties to all queried candidates
         candidates.forEach(state => {
           state.realErrorsCount++;
           state.penalty = Math.min(1000, state.penalty + 200);
@@ -269,11 +292,9 @@ function raceDNS(queryBuffer, timeoutMs = 3000) {
       timeout
     });
 
-    // Send UDP queries in parallel (O(1) candidates selection)
     candidates.forEach(state => {
       udpSocket.send(upstreamQuery, 0, upstreamQuery.length, 53, state.ip, (err) => {
         if (err) {
-          // Instant send failure penalty
           state.realErrorsCount++;
           state.penalty = Math.min(1000, state.penalty + 100);
           state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
@@ -341,7 +362,7 @@ setInterval(() => {
   }
 }, 120000);
 
-// Core DNS-over-HTTPS request processor
+// Core DNS-over-HTTPS request processor (Optimized with SWR Caching)
 async function handleDoH(queryBuffer) {
   const startTime = Date.now();
   stats.totalQueries++;
@@ -356,38 +377,78 @@ async function handleDoH(queryBuffer) {
 
   const cacheKey = getCacheKey(dnsQueryObj);
 
-  // 1. Cache Lookup
+  // 1. Cache Lookup with SWR (Stale-While-Revalidate)
   if (cacheKey) {
     const cachedEntry = cache.get(cacheKey);
-    if (cachedEntry && Date.now() < cachedEntry.expiresAt) {
-      stats.cacheHits++;
-      const clientTxId = queryBuffer.readUInt16BE(0);
-      const responseBuffer = Buffer.from(cachedEntry.buffer);
-      responseBuffer.writeUInt16BE(clientTxId, 0);
+    if (cachedEntry) {
+      const ageSec = (Date.now() - cachedEntry.cachedAt) / 1000;
+      
+      if (ageSec < cachedEntry.originalTtl) {
+        // Cache is still valid!
+        const clientTxId = queryBuffer.readUInt16BE(0);
+        const responseBuffer = Buffer.from(cachedEntry.buffer);
+        responseBuffer.writeUInt16BE(clientTxId, 0);
 
-      const latency = Date.now() - startTime;
-      stats.totalLatency += latency;
-      stats.averageLatency = stats.totalLatency / stats.totalQueries;
+        // Check SWR Condition: >70% of TTL consumed OR <15s remaining
+        const remainingTtl = cachedEntry.originalTtl - ageSec;
+        const shouldRevalidate = (ageSec > cachedEntry.originalTtl * 0.7) || (remainingTtl < 15);
 
-      return responseBuffer;
+        if (shouldRevalidate) {
+          stats.swrHits++;
+          // Trigger asynchronous background revalidation
+          setTimeout(() => {
+            raceDNS(queryBuffer)
+              .then(({ responseBuffer }) => {
+                try {
+                  const dnsRespObj = dnsPacket.decode(responseBuffer);
+                  const ttl = getMinTTL(dnsRespObj);
+                  cache.set(cacheKey, {
+                    buffer: responseBuffer,
+                    cachedAt: Date.now(),
+                    originalTtl: ttl,
+                    expiresAt: Date.now() + ttl * 1000
+                  });
+                } catch (e) {
+                  // Ignore parse error in background revalidation
+                }
+              })
+              .catch(() => {
+                // Ignore query failures in background
+              });
+          }, 0);
+        } else {
+          stats.cacheHits++;
+        }
+
+        const latency = Date.now() - startTime;
+        stats.totalLatency += latency;
+        stats.averageLatency = stats.totalLatency / stats.totalQueries;
+
+        return responseBuffer;
+      } else {
+        // Cache expired, delete it
+        cache.delete(cacheKey);
+      }
     }
   }
 
   // 2. Cache Miss: Run Upstream Race
   stats.cacheMisses++;
   try {
-    const { responseBuffer, from } = await raceDNS(queryBuffer);
+    const { responseBuffer } = await raceDNS(queryBuffer);
     const latency = Date.now() - startTime;
     stats.totalLatency += latency;
     stats.averageLatency = stats.totalLatency / stats.totalQueries;
 
-    // Cache successful response
+    // Cache successful response (recording cachedAt and originalTtl for SWR)
     if (cacheKey) {
       try {
         const dnsRespObj = dnsPacket.decode(responseBuffer);
         const ttl = getMinTTL(dnsRespObj);
         cache.set(cacheKey, {
           buffer: responseBuffer,
+          cachedAt: Date.now(),
+          originalTtl: ttl,
           expiresAt: Date.now() + ttl * 1000
         });
       } catch (e) {
@@ -403,7 +464,7 @@ async function handleDoH(queryBuffer) {
       const servFailPacket = dnsPacket.encode({
         type: 'response',
         id: decodedQuery.id,
-        flags: dnsPacket.AUTHORITATIVE_ANSWER | 2, // 2: Server failure
+        flags: dnsPacket.AUTHORITATIVE_ANSWER | 2,
         questions: decodedQuery.questions
       });
       return servFailPacket;
@@ -479,12 +540,13 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Endpoint 2: JSON API Stats (Includes detailed load balance & adaptive parameters)
+  // Endpoint 2: JSON API Stats (Includes detailed load balance & SWR data)
   if (parsedUrl.pathname === '/api/stats') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ...stats,
       upstreams: upstreamStates,
+      poolSize: currentPoolSize,
       cacheSize: cache.size,
       uptime: process.uptime()
     }));
@@ -565,13 +627,13 @@ const server = http.createServer(async (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Antigravity Adaptive DNS Load Balancer</title>
+    <title>Antigravity Hyper-Speed DNS</title>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-color: #05070f;
-            --panel-bg: rgba(10, 15, 30, 0.65);
-            --border-color: rgba(255, 255, 255, 0.05);
+            --bg-color: #03050a;
+            --panel-bg: rgba(8, 12, 24, 0.7);
+            --border-color: rgba(255, 255, 255, 0.04);
             --accent-glow: linear-gradient(135deg, #00f2fe 0%, #4facfe 100%);
             --accent-solid: #00f2fe;
             --text-color: #f3f4f6;
@@ -595,8 +657,8 @@ const server = http.createServer(async (req, res) => {
             min-height: 100vh;
             overflow-x: hidden;
             background-image: 
-                radial-gradient(circle at 10% 15%, rgba(0, 242, 254, 0.04) 0%, transparent 35%),
-                radial-gradient(circle at 90% 85%, rgba(79, 172, 254, 0.04) 0%, transparent 35%);
+                radial-gradient(circle at 15% 15%, rgba(0, 242, 254, 0.05) 0%, transparent 30%),
+                radial-gradient(circle at 85% 85%, rgba(79, 172, 254, 0.05) 0%, transparent 30%);
         }
 
         .container {
@@ -628,7 +690,7 @@ const server = http.createServer(async (req, res) => {
 
         .grid-stats {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
             gap: 20px;
             margin-bottom: 35px;
         }
@@ -638,7 +700,7 @@ const server = http.createServer(async (req, res) => {
             border: 1px solid var(--border-color);
             backdrop-filter: blur(20px);
             border-radius: 20px;
-            padding: 24px;
+            padding: 22px;
             position: relative;
             overflow: hidden;
             transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
@@ -665,23 +727,23 @@ const server = http.createServer(async (req, res) => {
 
         .stat-title {
             color: var(--text-muted);
-            font-size: 0.85rem;
+            font-size: 0.8rem;
             text-transform: uppercase;
             letter-spacing: 1px;
-            margin-bottom: 8px;
+            margin-bottom: 6px;
         }
 
         .stat-value {
-            font-size: 2rem;
+            font-size: 1.8rem;
             font-weight: 600;
             font-variant-numeric: tabular-nums;
         }
 
         .stat-unit {
-            font-size: 0.85rem;
+            font-size: 0.8rem;
             color: var(--text-muted);
             font-weight: 400;
-            margin-left: 3px;
+            margin-left: 2px;
         }
 
         .main-panel {
@@ -952,8 +1014,8 @@ const server = http.createServer(async (req, res) => {
 <body>
     <div class="container">
         <header>
-            <h1>Antigravity Adaptive DNS</h1>
-            <p>Hệ thống định tuyến thích ứng EMA, cân bằng tải & tối ưu hoá trễ truy vấn thực tế</p>
+            <h1>Antigravity Hyper-Speed DNS</h1>
+            <p>Định tuyến thích ứng EMA, tối ưu hoá bộ nhớ đệm SWR & Racing Pool thông minh</p>
         </header>
 
         <div class="grid-stats">
@@ -962,21 +1024,25 @@ const server = http.createServer(async (req, res) => {
                 <div class="stat-value" id="total-queries">0</div>
             </div>
             <div class="stat-card">
-                <div class="stat-title">Tỉ lệ Cache Hit</div>
+                <div class="stat-title">Cache Hit thông thường</div>
                 <div class="stat-value" id="cache-hit-rate">0<span class="stat-unit">%</span></div>
             </div>
             <div class="stat-card">
-                <div class="stat-title">Độ trễ hệ thống</div>
+                <div class="stat-title">Tối ưu hóa SWR (0ms)</div>
+                <div class="stat-value" id="swr-hits">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-title">Độ trễ trung bình</div>
                 <div class="stat-value" id="avg-latency">0<span class="stat-unit">ms</span></div>
             </div>
             <div class="stat-card">
-                <div class="stat-title">Bộ nhớ đệm</div>
-                <div class="stat-value" id="cache-size">0<span class="stat-unit">records</span></div>
+                <div class="stat-title">Kích thước Racing Pool</div>
+                <div class="stat-value" id="pool-size">0<span class="stat-unit">servers</span></div>
             </div>
         </div>
 
         <div class="main-panel">
-            <h2>Bảng giám sát cân bằng tải & hiệu năng thích ứng (Adaptive DNS)</h2>
+            <h2>Bảng hiệu năng thích ứng (Adaptive DNS & Racing Leaderboard)</h2>
             <div class="table-container">
                 <table>
                     <thead>
@@ -1014,7 +1080,7 @@ const server = http.createServer(async (req, res) => {
                     </div>
                     <div class="device-content">
                         <p>Nhấp vào nút bên dưới để tải và cài đặt profile hệ thống:</p>
-                        <a href="/download-profile" class="btn-download">Tải Profile Cấu Hình (.mobileconfig)</a>
+                        <a href="/download-profile" class="btn-download">Tải Profile Cấu Hìn (.mobileconfig)</a>
                         <p style="margin-top: 15px; font-size: 0.9rem; color: var(--text-muted);">
                             <strong>Tính năng bảo mật nâng cao:</strong><br>
                             • <strong>Ép buộc điều tuyến (Prohibit Fallback)</strong>: Gom và buộc 100% truy vấn DNS đi qua máy chủ DoH, ngăn chặn việc rò rỉ (leak) ra DNS mặc định của Wi-Fi hay nhà mạng di động.<br>
@@ -1046,7 +1112,7 @@ const server = http.createServer(async (req, res) => {
         </div>
 
         <footer>
-            <p>Thuật toán tự thích ứng EMA & O(1) Routing. Phát triển bởi Antigravity Coding Engine v3.</p>
+            <p>Thuật toán tối ưu SWR Caching & Dynamic Jitter Racing. Phát triển bởi Antigravity Coding Engine v3.</p>
         </footer>
     </div>
 
@@ -1078,8 +1144,9 @@ const server = http.createServer(async (req, res) => {
                 document.getElementById('total-queries').innerText = data.totalQueries.toLocaleString();
                 const hitRate = data.totalQueries > 0 ? Math.round((data.cacheHits / data.totalQueries) * 100) : 0;
                 document.getElementById('cache-hit-rate').innerHTML = hitRate + '<span class="stat-unit">%</span>';
+                document.getElementById('swr-hits').innerText = data.swrHits.toLocaleString();
                 document.getElementById('avg-latency').innerHTML = Math.round(data.averageLatency) + '<span class="stat-unit">ms</span>';
-                document.getElementById('cache-size').innerHTML = data.cacheSize + '<span class="stat-unit">records</span>';
+                document.getElementById('pool-size').innerHTML = data.poolSize + '<span class="stat-unit">servers</span>';
 
                 const tableBody = document.getElementById('dns-table-body');
                 tableBody.innerHTML = '';
@@ -1087,7 +1154,6 @@ const server = http.createServer(async (req, res) => {
                 const upstreams = data.upstreams || [];
                 const totalRouted = upstreams.reduce((acc, curr) => acc + curr.routedQueries, 0);
 
-                // Sort by routing score ascending (exactly how server sorts candidates)
                 const sortedUpstreams = [...upstreams].sort((a, b) => {
                     if (a.status === 'Offline') return 1;
                     if (b.status === 'Offline') return -1;
@@ -1101,28 +1167,27 @@ const server = http.createServer(async (req, res) => {
                     if (dns.status === 'Offline') {
                         rankText = 'Offline';
                         rankClass = 'rank-offline';
-                    } else if (index === 0) {
-                        rankText = '#1 Primary';
-                        rankClass = 'rank-primary';
-                    } else if (index === 1) {
-                        rankText = '#2 Secondary';
-                        rankClass = 'rank-secondary';
+                    } else if (index < data.poolSize) {
+                        if (index === 0) {
+                          rankText = '#1 Primary';
+                          rankClass = 'rank-primary';
+                        } else {
+                          rankText = '#' + (index + 1) + ' Racing';
+                          rankClass = 'rank-secondary';
+                        }
                     }
 
                     const routedPercent = totalRouted > 0 ? Math.round((dns.routedQueries / totalRouted) * 100) : 0;
                     
-                    // Latency class
                     let latClass = 'latency-Healthy';
                     if (dns.avgLatency > 250) latClass = 'latency-Offline';
                     else if (dns.avgLatency > 120) latClass = 'latency-Warning';
 
-                    // Real latency display
                     let realLatStr = '--';
                     if (dns.realAvgLatency > 0) {
                         realLatStr = dns.realAvgLatency + ' ms';
                     }
 
-                    // Penalty tag
                     let penaltyTag = '';
                     if (dns.penalty > 0) {
                         penaltyTag = '<span class="penalty-badge">+' + dns.penalty + 'ms Phạt</span>';
@@ -1167,6 +1232,6 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Antigravity Adaptive DNS Server running on http://localhost:${PORT}`);
+  console.log(`Antigravity Hyper-Speed DNS Server running on http://localhost:${PORT}`);
   console.log(`DNS health-check active monitoring started.`);
 });
