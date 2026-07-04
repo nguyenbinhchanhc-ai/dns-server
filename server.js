@@ -28,19 +28,39 @@ const stats = {
   averageLatency: 0
 };
 
-// Upstream Performance & Health Registry
+// Upstream Performance & Health Registry (Adaptive with EMA & Penalty)
 const upstreamStates = UPSTREAMS.map(dns => ({
   ip: dns.ip,
   name: dns.name,
-  pings: [],            // Last 5 ping latencies for sliding window
+  pings: [],              // Last 5 ping latencies for sliding window
   successCount: 0,
   failCount: 0,
-  avgLatency: 120,      // Default initial latency estimate
+  avgLatency: 120,        // Active ping latency average
   lossRate: 0,
-  score: 120,           // Lower is better (latency + packet loss penalty)
-  routedQueries: 0,     // Total client queries won by this upstream
-  status: 'Healthy'     // 'Healthy', 'Warning', 'Offline'
+  
+  // Real-world client query performance
+  realAvgLatency: 0,      // Exponential Moving Average (EMA) of real queries
+  realQueriesCount: 0,    // Total real queries sent
+  realErrorsCount: 0,     // Total real query errors/timeouts
+  
+  penalty: 0,             // Active penalty (ms) for errors, decays over time
+  score: 120,             // Routing score = avgLatency + lossRate*5 + penalty (lower is better)
+  routedQueries: 0,       // Total client queries won by this upstream
+  status: 'Healthy'       // 'Healthy', 'Warning', 'Offline'
 }));
+
+// Pre-sorted active candidates for O(1) routing
+let activeCandidates = [];
+
+function updateCandidates() {
+  const sorted = [...upstreamStates]
+    .filter(s => s.status !== 'Offline')
+    .sort((a, b) => a.score - b.score);
+    
+  activeCandidates = sorted.length >= 2 
+    ? sorted.slice(0, 2) 
+    : (sorted.length > 0 ? sorted : upstreamStates.slice(0, 2));
+}
 
 // In-Memory DNS Cache (Key: name:type:class)
 const cache = new Map();
@@ -153,64 +173,111 @@ async function performHealthChecks() {
     const lostCount = state.pings.filter(p => p === 1000).length;
     state.lossRate = Math.round((lostCount / state.pings.length) * 100);
 
-    // Score = avgLatency + packet loss penalty
-    // Every 20% packet loss adds 100ms penalty
-    state.score = state.avgLatency + (state.lossRate * 5);
+    // Decay current penalty by 50% on every active health check tick
+    state.penalty = Math.max(0, Math.round(state.penalty * 0.5));
+
+    // Score = avgLatency + packet loss penalty + active penalty
+    state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
 
     // Determine status
     if (state.lossRate >= 60) {
       state.status = 'Offline';
-    } else if (state.lossRate >= 20 || state.avgLatency > 250) {
+    } else if (state.lossRate >= 20 || state.avgLatency > 250 || state.penalty > 200) {
       state.status = 'Warning';
     } else {
       state.status = 'Healthy';
     }
   }));
+
+  updateCandidates();
 }
 
-// Perform initial check and schedule every 25 seconds
-performHealthChecks();
+// Perform initial check, set candidates list and schedule every 25 seconds
+performHealthChecks().then(() => {
+  updateCandidates();
+});
 setInterval(performHealthChecks, 25000);
 
-// Perform DNS racing on top 2 healthiest servers
+// Perform DNS racing on pre-sorted top 2 healthiest servers
 function raceDNS(queryBuffer, timeoutMs = 3000) {
   return new Promise((resolve, reject) => {
-    // Sort states by score ascending (lowest score is best)
-    const sortedActive = upstreamStates
-      .filter(s => s.status !== 'Offline')
-      .sort((a, b) => a.score - b.score);
-
-    // Get candidates: top 2 healthiest, or default fallback to top 2 if all offline
-    const candidates = sortedActive.length >= 2 
-      ? sortedActive.slice(0, 2) 
-      : (sortedActive.length > 0 ? sortedActive : upstreamStates.slice(0, 2));
-
+    const candidates = activeCandidates;
     const originalTxId = queryBuffer.readUInt16BE(0);
     const myTxId = getNextTxId();
 
     const upstreamQuery = Buffer.from(queryBuffer);
     upstreamQuery.writeUInt16BE(myTxId, 0);
 
+    const startTime = Date.now();
+
     const timeout = setTimeout(() => {
       pendingQueries.delete(myTxId);
+      
+      // Apply timeout penalties to all queried candidates
+      candidates.forEach(state => {
+        state.realErrorsCount++;
+        state.penalty = Math.min(1000, state.penalty + 250); // Instant 250ms penalty
+        state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
+      });
+      updateCandidates();
+
       reject(new Error('DNS racing query timeout'));
     }, timeoutMs);
 
     pendingQueries.set(myTxId, {
       resolve: ({ buffer, from }) => {
+        clearTimeout(timeout);
+        const latency = Date.now() - startTime;
+        
         const responseBuffer = Buffer.from(buffer);
         responseBuffer.writeUInt16BE(originalTxId, 0);
+        
+        // Track stats & calculate EMA for the winner
+        const winner = upstreamStates.find(s => s.ip === from);
+        if (winner) {
+          winner.routedQueries++;
+          
+          // Exponential Moving Average (EMA) with alpha = 0.3
+          const alpha = 0.3;
+          winner.realAvgLatency = winner.realQueriesCount === 0 
+            ? latency 
+            : Math.round(alpha * latency + (1 - alpha) * winner.realAvgLatency);
+          winner.realQueriesCount++;
+          
+          // Reduce penalty slightly for successful real query
+          winner.penalty = Math.max(0, winner.penalty - 25);
+          winner.score = winner.avgLatency + (winner.lossRate * 5) + winner.penalty;
+        }
+
+        updateCandidates();
         resolve({ responseBuffer, from });
       },
-      reject,
+      reject: (err) => {
+        clearTimeout(timeout);
+        pendingQueries.delete(myTxId);
+        
+        // Apply error penalties to all queried candidates
+        candidates.forEach(state => {
+          state.realErrorsCount++;
+          state.penalty = Math.min(1000, state.penalty + 200);
+          state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
+        });
+        updateCandidates();
+
+        reject(err);
+      },
       timeout
     });
 
-    // Send UDP queries in parallel to the selected fast candidates
+    // Send UDP queries in parallel (O(1) candidates selection)
     candidates.forEach(state => {
       udpSocket.send(upstreamQuery, 0, upstreamQuery.length, 53, state.ip, (err) => {
         if (err) {
-          // Log or ignore specific send failures
+          // Instant send failure penalty
+          state.realErrorsCount++;
+          state.penalty = Math.min(1000, state.penalty + 100);
+          state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
+          updateCandidates();
         }
       });
     });
@@ -314,12 +381,6 @@ async function handleDoH(queryBuffer) {
     stats.totalLatency += latency;
     stats.averageLatency = stats.totalLatency / stats.totalQueries;
 
-    // Track which upstream server won the race
-    const winner = upstreamStates.find(s => s.ip === from);
-    if (winner) {
-      winner.routedQueries++;
-    }
-
     // Cache successful response
     if (cacheKey) {
       try {
@@ -418,7 +479,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Endpoint 2: JSON API Stats (Includes detailed load balance data)
+  // Endpoint 2: JSON API Stats (Includes detailed load balance & adaptive parameters)
   if (parsedUrl.pathname === '/api/stats') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -494,15 +555,15 @@ const server = http.createServer(async (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Antigravity DNS Accelerator & Load Balancer</title>
+    <title>Antigravity Adaptive DNS Load Balancer</title>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-color: #060913;
-            --panel-bg: rgba(13, 20, 38, 0.65);
-            --border-color: rgba(255, 255, 255, 0.06);
-            --accent-glow: linear-gradient(135deg, #00f7ff 0%, #0088ff 100%);
-            --accent-solid: #00f7ff;
+            --bg-color: #05070f;
+            --panel-bg: rgba(10, 15, 30, 0.65);
+            --border-color: rgba(255, 255, 255, 0.05);
+            --accent-glow: linear-gradient(135deg, #00f2fe 0%, #4facfe 100%);
+            --accent-solid: #00f2fe;
             --text-color: #f3f4f6;
             --text-muted: #9ca3af;
             
@@ -524,8 +585,8 @@ const server = http.createServer(async (req, res) => {
             min-height: 100vh;
             overflow-x: hidden;
             background-image: 
-                radial-gradient(circle at 5% 15%, rgba(0, 247, 255, 0.05) 0%, transparent 35%),
-                radial-gradient(circle at 95% 85%, rgba(0, 136, 255, 0.05) 0%, transparent 35%);
+                radial-gradient(circle at 10% 15%, rgba(0, 242, 254, 0.04) 0%, transparent 35%),
+                radial-gradient(circle at 90% 85%, rgba(79, 172, 254, 0.04) 0%, transparent 35%);
         }
 
         .container {
@@ -542,7 +603,7 @@ const server = http.createServer(async (req, res) => {
         header h1 {
             font-size: 2.8rem;
             font-weight: 800;
-            background: linear-gradient(to right, #00f7ff, #0088ff);
+            background: linear-gradient(to right, #00f2fe, #4facfe);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             margin-bottom: 8px;
@@ -575,8 +636,8 @@ const server = http.createServer(async (req, res) => {
 
         .stat-card:hover {
             transform: translateY(-4px);
-            border-color: rgba(0, 247, 255, 0.2);
-            box-shadow: 0 12px 35px rgba(0, 247, 255, 0.04);
+            border-color: rgba(0, 242, 254, 0.2);
+            box-shadow: 0 12px 35px rgba(0, 242, 254, 0.04);
         }
 
         .stat-card::before {
@@ -741,10 +802,9 @@ const server = http.createServer(async (req, res) => {
 
         .btn-download:hover {
             transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(0, 247, 255, 0.25);
+            box-shadow: 0 5px 15px rgba(0, 242, 254, 0.25);
         }
 
-        /* Leaderboard / Table Style */
         .table-container {
             width: 100%;
             overflow-x: auto;
@@ -787,9 +847,9 @@ const server = http.createServer(async (req, res) => {
         }
 
         .rank-primary {
-            background: rgba(0, 247, 255, 0.15);
+            background: rgba(0, 242, 254, 0.15);
             color: var(--accent-solid);
-            border: 1px solid rgba(0, 247, 255, 0.3);
+            border: 1px solid rgba(0, 242, 254, 0.3);
         }
 
         .rank-secondary {
@@ -830,7 +890,7 @@ const server = http.createServer(async (req, res) => {
 
         .progress-bar-container {
             width: 100%;
-            max-width: 200px;
+            max-width: 150px;
             height: 8px;
             background: rgba(255, 255, 255, 0.04);
             border-radius: 4px;
@@ -859,6 +919,17 @@ const server = http.createServer(async (req, res) => {
         .latency-Warning { color: var(--color-warning); }
         .latency-Offline { color: var(--color-offline); }
 
+        .penalty-badge {
+            background: rgba(255, 59, 48, 0.12);
+            color: #ff453a;
+            border: 1px solid rgba(255, 59, 48, 0.2);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            margin-left: 5px;
+        }
+
         footer {
             text-align: center;
             color: var(--text-muted);
@@ -871,8 +942,8 @@ const server = http.createServer(async (req, res) => {
 <body>
     <div class="container">
         <header>
-            <h1>Antigravity DNS Accelerator & Load Balancer</h1>
-            <p>Hệ thống tự động giám sát ping, cân bằng tải & tăng tốc độ internet</p>
+            <h1>Antigravity Adaptive DNS</h1>
+            <p>Hệ thống định tuyến thích ứng EMA, cân bằng tải & tối ưu hoá trễ truy vấn thực tế</p>
         </header>
 
         <div class="grid-stats">
@@ -885,7 +956,7 @@ const server = http.createServer(async (req, res) => {
                 <div class="stat-value" id="cache-hit-rate">0<span class="stat-unit">%</span></div>
             </div>
             <div class="stat-card">
-                <div class="stat-title">Độ trễ trung bình</div>
+                <div class="stat-title">Độ trễ hệ thống</div>
                 <div class="stat-value" id="avg-latency">0<span class="stat-unit">ms</span></div>
             </div>
             <div class="stat-card">
@@ -895,18 +966,19 @@ const server = http.createServer(async (req, res) => {
         </div>
 
         <div class="main-panel">
-            <h2>Bảng giám sát cân bằng tải & hiệu năng Upstream DNS</h2>
+            <h2>Bảng giám sát cân bằng tải & hiệu năng thích ứng (Adaptive DNS)</h2>
             <div class="table-container">
                 <table>
                     <thead>
                         <tr>
-                            <th>Thứ hạng</th>
+                            <th>Định tuyến</th>
                             <th>DNS Server</th>
-                            <th>Địa chỉ IP</th>
-                            <th>Độ trễ (Ping)</th>
-                            <th>Mất gói (%)</th>
+                            <th>IP</th>
+                            <th>Ping Active</th>
+                            <th>Trễ Thực Tế (EMA)</th>
+                            <th>Mất gói / Lỗi</th>
                             <th>Trạng thái</th>
-                            <th>Phân chia tải</th>
+                            <th>Chia tải thực tế</th>
                         </tr>
                     </thead>
                     <tbody id="dns-table-body">
@@ -927,49 +999,39 @@ const server = http.createServer(async (req, res) => {
             <div class="setup-steps">
                 <div class="device-accordion">
                     <div class="device-header" onclick="toggleAccordion(this)">
-                        <span>Apple iOS / macOS (Tự động tải profile cấu hình)</span>
+                        <span>Apple iOS / macOS (Tải profile hệ thống tự động)</span>
                         <span class="arrow"></span>
                     </div>
                     <div class="device-content">
-                        <p>iOS và macOS hỗ trợ cấu hình DoH hệ thống bằng cấu hình di động. Nhấn nút bên dưới để tải tệp cài đặt và làm theo hướng dẫn.</p>
-                        <a href="/download-profile" class="btn-download">Tải Profile DoH (.mobileconfig)</a>
-                        <p style="margin-top: 15px; font-size: 0.9rem; color: var(--text-muted);">* Đi tới <strong>Cài đặt</strong> -> <strong>Hồ sơ đã tải về</strong> để kích hoạt sau khi hoàn tất tải.</p>
+                        <p>Nhấp vào nút bên dưới để tải và cài đặt profile hệ thống:</p>
+                        <a href="/download-profile" class="btn-download">Tải Profile Cấu Hình (.mobileconfig)</a>
                     </div>
                 </div>
 
                 <div class="device-accordion">
                     <div class="device-header" onclick="toggleAccordion(this)">
-                        <span>Google Android (Sử dụng Nebulo hoặc Intra)</span>
+                        <span>Google Android (Thông qua Intra/Nebulo)</span>
                         <span class="arrow"></span>
                     </div>
                     <div class="device-content">
-                        <p>Do Render chạy trên cổng 443 HTTPS, Android yêu cầu app hỗ trợ DoH để dịch gói tin toàn hệ thống:</p>
-                        <ol style="margin-top: 10px;">
-                            <li>Tải app <strong>Intra</strong> hoặc <strong>Nebulo</strong> miễn phí trên Play Store.</li>
-                            <li>Vào phần thiết lập DNS cá nhân (Custom Server URL).</li>
-                            <li>Dán URL DoH bên trên của bạn vào và nhấn Lưu.</li>
-                            <li>Bật ứng dụng lên để phân luồng tốc độ cao.</li>
-                        </ol>
+                        <p>Sử dụng app **Intra** hoặc **Nebulo** trên Android, thêm Custom URL và dán đường link DoH phía trên của bạn vào.</p>
                     </div>
                 </div>
 
                 <div class="device-accordion">
                     <div class="device-header" onclick="toggleAccordion(this)">
-                        <span>Trình duyệt (Chrome / Firefox / Edge / Brave)</span>
+                        <span>Trình duyệt (Chrome / Firefox / Edge)</span>
                         <span class="arrow"></span>
                     </div>
                     <div class="device-content">
-                        <h4 style="font-size: 1rem;">Chrome / Edge / Brave:</h4>
-                        <p>Vào Cài đặt -> Quyền riêng tư và bảo mật -> Bảo mật -> Chọn Sử dụng DNS an toàn -> Nhập thủ công dán link DoH của bạn vào.</p>
-                        <h4 style="margin-top: 15px; font-size: 1rem;">Firefox:</h4>
-                        <p>Settings -> Privacy & Security -> DNS over HTTPS -> chọn Max Protection -> Custom Provider -> điền link DoH của bạn.</p>
+                        <p>Mở mục Cài đặt DNS an toàn trên trình duyệt của bạn (Chrome: Bảo mật -> Sử dụng DNS an toàn -> Tùy chỉnh; Firefox: Quyền riêng tư -> DNS qua HTTPS -> Max -> Tùy chỉnh) và dán link DoH vào.</p>
                     </div>
                 </div>
             </div>
         </div>
 
         <footer>
-            <p>Phát triển bởi Antigravity Coding Engine v3. Tự động kiểm tra sức khỏe DNS định kỳ.</p>
+            <p>Thuật toán tự thích ứng EMA & O(1) Routing. Phát triển bởi Antigravity Coding Engine v3.</p>
         </footer>
     </div>
 
@@ -983,7 +1045,7 @@ const server = http.createServer(async (req, res) => {
             navigator.clipboard.writeText(urlText).then(() => {
                 const btn = document.querySelector('.btn-copy');
                 btn.innerText = 'Đã chép!';
-                btn.style.background = '#00f7ff';
+                btn.style.background = '#00f2fe';
                 btn.style.color = '#000';
                 setTimeout(() => {
                     btn.innerText = 'Sao chép';
@@ -998,22 +1060,19 @@ const server = http.createServer(async (req, res) => {
                 const res = await fetch('/api/stats');
                 const data = await res.json();
                 
-                // Update Cards
                 document.getElementById('total-queries').innerText = data.totalQueries.toLocaleString();
                 const hitRate = data.totalQueries > 0 ? Math.round((data.cacheHits / data.totalQueries) * 100) : 0;
                 document.getElementById('cache-hit-rate').innerHTML = hitRate + '<span class="stat-unit">%</span>';
                 document.getElementById('avg-latency').innerHTML = Math.round(data.averageLatency) + '<span class="stat-unit">ms</span>';
                 document.getElementById('cache-size').innerHTML = data.cacheSize + '<span class="stat-unit">records</span>';
 
-                // Render Load Balancer Table
                 const tableBody = document.getElementById('dns-table-body');
                 tableBody.innerHTML = '';
 
-                // Calculate total queries routed to upstreams to calculate percentages
                 const upstreams = data.upstreams || [];
                 const totalRouted = upstreams.reduce((acc, curr) => acc + curr.routedQueries, 0);
 
-                // Sort upstreams based on score (to match routing preference order)
+                // Sort by routing score ascending (exactly how server sorts candidates)
                 const sortedUpstreams = [...upstreams].sort((a, b) => {
                     if (a.status === 'Offline') return 1;
                     if (b.status === 'Offline') return -1;
@@ -1021,11 +1080,11 @@ const server = http.createServer(async (req, res) => {
                 });
 
                 sortedUpstreams.forEach((dns, index) => {
-                    let rankText = 'Mặc định';
+                    let rankText = 'Backup';
                     let rankClass = 'rank-backup';
                     
                     if (dns.status === 'Offline') {
-                        rankText = 'Mất kết nối';
+                        rankText = 'Offline';
                         rankClass = 'rank-offline';
                     } else if (index === 0) {
                         rankText = '#1 Primary';
@@ -1033,24 +1092,34 @@ const server = http.createServer(async (req, res) => {
                     } else if (index === 1) {
                         rankText = '#2 Secondary';
                         rankClass = 'rank-secondary';
-                    } else {
-                        rankText = 'Backup';
                     }
 
                     const routedPercent = totalRouted > 0 ? Math.round((dns.routedQueries / totalRouted) * 100) : 0;
-                    
-                    const row = document.createElement('tr');
                     
                     // Latency class
                     let latClass = 'latency-Healthy';
                     if (dns.avgLatency > 250) latClass = 'latency-Offline';
                     else if (dns.avgLatency > 120) latClass = 'latency-Warning';
 
+                    // Real latency display
+                    let realLatStr = '--';
+                    if (dns.realAvgLatency > 0) {
+                        realLatStr = dns.realAvgLatency + ' ms';
+                    }
+
+                    // Penalty tag
+                    let penaltyTag = '';
+                    if (dns.penalty > 0) {
+                        penaltyTag = '<span class="penalty-badge">+' + dns.penalty + 'ms Phạt</span>';
+                    }
+
+                    const row = document.createElement('tr');
                     row.innerHTML = '<td><span class="dns-rank-badge ' + rankClass + '">' + rankText + '</span></td>' +
-                        '<td><strong>' + dns.name + '</strong></td>' +
+                        '<td><strong>' + dns.name + '</strong>' + penaltyTag + '</td>' +
                         '<td style="font-family: monospace;">' + dns.ip + '</td>' +
                         '<td><span class="latency-badge ' + latClass + '">' + (dns.status === 'Offline' ? '--' : dns.avgLatency + ' ms') + '</span></td>' +
-                        '<td style="font-family: tabular-nums;">' + dns.lossRate + '%</td>' +
+                        '<td><span class="latency-badge" style="color: #4facfe;">' + realLatStr + '</span></td>' +
+                        '<td style="font-family: tabular-nums;">' + dns.lossRate + '% / ' + dns.realErrorsCount + ' lỗi</td>' +
                         '<td>' +
                             '<span class="status-indicator status-' + dns.status + '">' +
                                 '<span class="status-dot" style="background-color: currentColor;"></span>' +
@@ -1071,7 +1140,6 @@ const server = http.createServer(async (req, res) => {
             }
         }
 
-        // Run
         fetchStats();
         setInterval(fetchStats, 3000);
     </script>
@@ -1084,6 +1152,6 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Antigravity DNS Accelerator & Load Balancer running on http://localhost:${PORT}`);
+  console.log(`Antigravity Adaptive DNS Server running on http://localhost:${PORT}`);
   console.log(`DNS health-check active monitoring started.`);
 });
