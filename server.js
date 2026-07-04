@@ -93,6 +93,24 @@ function updateCandidates() {
   activeCandidates = sorted.slice(0, poolSize);
 }
 
+// Select a candidate using weighted probability to distribute load
+// Weights: #1 (60%), #2 (30%), #3 (10%)
+function selectWeightedUpstream(candidates) {
+  if (!candidates || candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0];
+
+  const rand = Math.random();
+  if (candidates.length === 2) {
+    if (rand < 0.7) return candidates[0];
+    return candidates[1];
+  }
+
+  // 3 or more candidates
+  if (rand < 0.6) return candidates[0];
+  if (rand < 0.9) return candidates[1];
+  return candidates[2];
+}
+
 // In-Memory DNS Cache (Key: name:type:class)
 const cache = new Map();
 
@@ -238,10 +256,15 @@ performHealthChecks().then(() => {
 });
 setInterval(performHealthChecks, 25000);
 
-// Perform DNS racing on adaptive candidates (Tuned timeout to 1200ms to clear queues fast and prevent congestion)
+// Perform DNS routing using Weighted Load Balancing + Speculative Backup Retry (150ms delay)
 function raceDNS(queryBuffer, timeoutMs = 1200) {
   return new Promise((resolve, reject) => {
     const candidates = activeCandidates;
+    if (candidates.length === 0) {
+      reject(new Error('No active DNS candidates'));
+      return;
+    }
+
     const originalTxId = queryBuffer.readUInt16BE(0);
     const myTxId = getNextTxId();
 
@@ -250,23 +273,31 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
 
     const startTime = Date.now();
 
+    // Select the primary upstream based on weights
+    const primary = selectWeightedUpstream(candidates);
+    let backupStarted = false;
+    let backupTimer = null;
+
     const timeout = setTimeout(() => {
       pendingQueries.delete(myTxId);
-      
+      if (backupTimer) clearTimeout(backupTimer);
+
       // Apply timeout penalties
-      candidates.forEach(state => {
+      const queried = backupStarted ? candidates : [primary];
+      queried.forEach(state => {
         state.realErrorsCount++;
         state.penalty = Math.min(1000, state.penalty + 250);
         state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
       });
       updateCandidates();
 
-      reject(new Error('DNS racing query timeout'));
+      reject(new Error('DNS query timeout'));
     }, timeoutMs);
 
     pendingQueries.set(myTxId, {
       resolve: ({ buffer, from }) => {
         clearTimeout(timeout);
+        if (backupTimer) clearTimeout(backupTimer);
         const latency = Date.now() - startTime;
         
         const responseBuffer = Buffer.from(buffer);
@@ -291,9 +322,11 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
       },
       reject: (err) => {
         clearTimeout(timeout);
+        if (backupTimer) clearTimeout(backupTimer);
         pendingQueries.delete(myTxId);
         
-        candidates.forEach(state => {
+        const queried = backupStarted ? candidates : [primary];
+        queried.forEach(state => {
           state.realErrorsCount++;
           state.penalty = Math.min(1000, state.penalty + 200);
           state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
@@ -305,16 +338,38 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
       timeout
     });
 
-    candidates.forEach(state => {
-      udpSocket.send(upstreamQuery, 0, upstreamQuery.length, 53, state.ip, (err) => {
-        if (err) {
-          state.realErrorsCount++;
-          state.penalty = Math.min(1000, state.penalty + 100);
-          state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
-          updateCandidates();
+    // Send query to the selected primary first
+    udpSocket.send(upstreamQuery, 0, upstreamQuery.length, 53, primary.ip, (err) => {
+      if (err) {
+        // If sending to primary fails instantly, trigger backup immediately
+        if (backupTimer) clearTimeout(backupTimer);
+        triggerBackup();
+      }
+    });
+
+    // Set speculative backup retry timer (150ms)
+    backupTimer = setTimeout(() => {
+      triggerBackup();
+    }, 150);
+
+    function triggerBackup() {
+      if (backupStarted) return;
+      backupStarted = true;
+
+      // Send query in parallel to the remaining candidates
+      candidates.forEach(state => {
+        if (state.ip !== primary.ip) {
+          udpSocket.send(upstreamQuery, 0, upstreamQuery.length, 53, state.ip, (err) => {
+            if (err) {
+              state.realErrorsCount++;
+              state.penalty = Math.min(1000, state.penalty + 100);
+              state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
+              updateCandidates();
+            }
+          });
         }
       });
-    });
+    }
   });
 }
 
