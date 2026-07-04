@@ -79,8 +79,8 @@ async function runTests() {
 
     console.log(`=> Số máy chủ DNS tham gia xử lý tải: ${activeUpstreamsCount}`);
     
-    if (activeUpstreamsCount <= 0) {
-      throw new Error('LỖI: Không có server nào xử lý truy vấn!');
+    if (activeUpstreamsCount <= 3) {
+      throw new Error(`LỖI: Chỉ có ${activeUpstreamsCount} server xử lý truy vấn! Mở rộng chia tải hoạt động chưa chính xác.`);
     }
     
     console.log('=> TEST 3: PASS');

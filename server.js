@@ -90,21 +90,21 @@ function updateCandidates() {
 
   poolSize = Math.max(2, Math.min(poolSize, sorted.length));
   currentPoolSize = poolSize;
-  activeCandidates = sorted.slice(0, poolSize);
+  activeCandidates = sorted; // Expand to all active candidates to allow 10 DNS servers load sharing
 }
 
-// Dynamic Latency-Sensitive Weighting: Select upstream based on inverse square of scores
-// Keeps fast servers busy (99% queries) and completely bypasses slow ones
+// Dynamic Latency-Sensitive Weighting: Select upstream based on inverse 1.5 power of scores
+// Spreads load to all healthy upstreams while keeping response speed ultra-fast
 function selectWeightedUpstream(candidates) {
   if (!candidates || candidates.length === 0) return null;
   if (candidates.length === 1) return candidates[0];
 
   const weights = candidates.map(c => {
     const score = Math.max(1, c.score);
-    // Inverse square gives strong priority to lower scores (e.g. 6ms vs 96ms becomes 256x difference)
+    // 1.5 power factor distributes queries across all healthy servers while preferring faster ones
     return {
       candidate: c,
-      value: Math.pow(1000 / score, 2)
+      value: Math.pow(1000 / score, 1.5)
     };
   });
 
@@ -378,9 +378,10 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
       if (backupStarted) return;
       backupStarted = true;
 
-      // Send to remaining candidates
-      candidates.forEach(state => {
-        if (state.ip !== primary.ip) {
+      // Send query to the top 2 fastest backup candidates (excluding the primary)
+      let sentCount = 0;
+      for (const state of candidates) {
+        if (state.ip !== primary.ip && sentCount < 2) {
           sock.send(upstreamQuery, 0, upstreamQuery.length, 53, state.ip, (err) => {
             if (err) {
               state.realErrorsCount++;
@@ -388,8 +389,9 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
               state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
             }
           });
+          sentCount++;
         }
-      });
+      }
     }
   });
 }
