@@ -93,18 +93,51 @@ function updateCandidates() {
   activeCandidates = sorted; // Expand to all active candidates to allow 10 DNS servers load sharing
 }
 
-// Dynamic Latency-Sensitive Weighting: Select upstream based on inverse 1.5 power of scores
-// Spreads load to all healthy upstreams while keeping response speed ultra-fast
-function selectWeightedUpstream(candidates) {
+// AI Operations Activity Log (Neon-themed Web UI log)
+const aiActivities = [];
+
+function logAiActivity(type, message) {
+  aiActivities.unshift({
+    time: new Date().toLocaleTimeString('vi-VN'),
+    type,
+    message
+  });
+  if (aiActivities.length > 15) aiActivities.pop();
+}
+
+// Domain-Specific DNS Latency records (domain -> Map(dnsIp -> latency))
+const domainDnsLatency = new Map();
+let lastRouterLogTime = 0;
+
+// Dynamic Latency-Sensitive Weighting + Domain-Peering AI Routing
+// Selects best upstream based on global stats, adjusted by domain-specific historical latency
+function selectWeightedUpstream(candidates, domain) {
   if (!candidates || candidates.length === 0) return null;
   if (candidates.length === 1) return candidates[0];
 
+  const domainMap = domain ? domainDnsLatency.get(domain) : null;
+  let loggedRouter = false;
+
   const weights = candidates.map(c => {
-    const score = Math.max(1, c.score);
-    // 1.5 power factor distributes queries across all healthy servers while preferring faster ones
+    let score = c.score;
+    
+    // AI Domain-Peering Tuning: Blend global score with historical domain-specific latency (50-50 weight)
+    if (domainMap && domainMap.has(c.ip)) {
+      const histLat = domainMap.get(c.ip);
+      score = Math.round(0.5 * score + 0.5 * (histLat + c.lossRate * 5 + c.penalty));
+      
+      const now = Date.now();
+      if (now - lastRouterLogTime > 4000 && !loggedRouter) {
+        logAiActivity('ROUTER', `Định tuyến AI: ${domain} ➔ ${c.name} (Tối ưu lịch sử: ${histLat}ms)`);
+        lastRouterLogTime = now;
+        loggedRouter = true;
+      }
+    }
+    
+    const scoreVal = Math.max(1, score);
     return {
       candidate: c,
-      value: Math.pow(1000 / score, 1.5)
+      value: Math.pow(1000 / scoreVal, 1.5)
     };
   });
 
@@ -281,7 +314,7 @@ setInterval(performHealthChecks, 25000);
 setInterval(updateCandidates, 5000); // Update rankings every 5s to keep CPU low
 
 // Perform DNS routing using Dynamic Weighted Load Balancing + Speculative Backup Retry (Dynamic delay)
-function raceDNS(queryBuffer, timeoutMs = 1200) {
+function raceDNS(queryBuffer, timeoutMs = 1200, domain) {
   return new Promise((resolve, reject) => {
     const candidates = activeCandidates;
     if (candidates.length === 0) {
@@ -298,8 +331,8 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
 
     const startTime = Date.now();
 
-    // Select primary dynamically by weights
-    const primary = selectWeightedUpstream(candidates);
+    // Select primary dynamically by weights and domain-peering AI
+    const primary = selectWeightedUpstream(candidates, domain);
     let backupStarted = false;
     let backupTimer = null;
 
@@ -470,6 +503,10 @@ function recordTransition(prev, current) {
   const count = nextMap.get(current) || 0;
   nextMap.set(current, count + 1);
   
+  if (count + 1 === 3) {
+    logAiActivity('LEARNER', `Liên kết chuỗi lướt web: ${prev} ➔ ${current}`);
+  }
+  
   // Keep memory bounded: limit next list to 5 items max per node
   if (nextMap.size > 5) {
     let lowestKey = null;
@@ -499,6 +536,8 @@ function predictAndPrefetch(currentDomain) {
       if (!cache.has(cacheKey) && !activeRevalidations.has(cacheKey)) {
         activeRevalidations.add(cacheKey);
         
+        logAiActivity('PREFETCH', `Tải ngầm dự phòng: ${nextDomain} (Dự đoán từ ${currentDomain})`);
+        
         const prefetchPacket = dnsPacket.encode({
           type: 'query',
           id: Math.floor(Math.random() * 65535),
@@ -509,8 +548,9 @@ function predictAndPrefetch(currentDomain) {
           }]
         });
         
-        raceDNS(prefetchPacket)
-          .then(({ responseBuffer }) => {
+        // Pass nextDomain to raceDNS for domain-peering routing
+        raceDNS(prefetchPacket, 1200, nextDomain)
+          .then(({ responseBuffer, from }) => {
             try {
               const dnsRespObj = dnsPacket.decode(responseBuffer);
               const ttl = getMinTTL(dnsRespObj);
@@ -524,6 +564,10 @@ function predictAndPrefetch(currentDomain) {
                 originalTtl: cacheTtl,
                 expiresAt: Date.now() + cacheTtl * 1000
               });
+
+              const provider = upstreamStates.find(s => s.ip === from);
+              const savedMs = provider ? provider.avgLatency : 45;
+              logAiActivity('CACHE', `Làm nóng cache thành công: ${nextDomain} (Lưu từ ${provider ? provider.name : 'DNS'} | Tiết kiệm ~${savedMs}ms)`);
             } catch (e) {}
           })
           .catch(() => {})
@@ -549,7 +593,6 @@ function isValidPublicIp(ip) {
   return true;
 }
 
-// Core DNS-over-HTTPS request processor (Optimized with SWR Caching, Deduplication, and ECS injection)
 async function handleDoH(queryBuffer, clientIp) {
   const startTime = Date.now();
   stats.totalQueries++;
@@ -562,19 +605,21 @@ async function handleDoH(queryBuffer, clientIp) {
     throw new Error('Format Error: Failed to parse DNS query');
   }
 
+  const domain = dnsQueryObj.questions && dnsQueryObj.questions.length > 0
+    ? dnsQueryObj.questions[0].name.toLowerCase()
+    : null;
+
   // Lightweight AI Behavior Predictor: link queries and proactively prefetch next domains
-  if (dnsQueryObj.questions && dnsQueryObj.questions.length > 0) {
+  if (domain) {
     try {
-      const currentName = dnsQueryObj.questions[0].name.toLowerCase();
       const now = Date.now();
-      
       if (lastDomainName && (now - lastDomainTime < 5000)) {
-        recordTransition(lastDomainName, currentName);
+        recordTransition(lastDomainName, domain);
       }
-      lastDomainName = currentName;
+      lastDomainName = domain;
       lastDomainTime = now;
       
-      predictAndPrefetch(currentName);
+      predictAndPrefetch(domain);
     } catch (e) {
       // Silently catch to avoid crashing critical path
     }
@@ -646,7 +691,7 @@ async function handleDoH(queryBuffer, clientIp) {
           
           // Trigger asynchronous background revalidation
           setTimeout(() => {
-            raceDNS(queryBuffer)
+            raceDNS(queryBuffer, 1200, domain)
               .then(({ responseBuffer }) => {
                 try {
                   const dnsRespObj = dnsPacket.decode(responseBuffer);
@@ -690,10 +735,21 @@ async function handleDoH(queryBuffer, clientIp) {
   // 2. Cache Miss: Run Upstream Race
   stats.cacheMisses++;
   try {
-    const { responseBuffer } = await raceDNS(queryBuffer);
+    const { responseBuffer, from } = await raceDNS(queryBuffer, 1200, domain);
     const latency = Date.now() - startTime;
     stats.totalLatency += latency;
     stats.averageLatency = stats.totalLatency / stats.totalQueries;
+
+    // AI Domain-Peering: update specific domain latency mapping for the winning DNS
+    if (from && domain) {
+      let domainMap = domainDnsLatency.get(domain);
+      if (!domainMap) {
+        domainMap = new Map();
+        domainDnsLatency.set(domain, domainMap);
+      }
+      const currentEma = domainMap.get(from) || latency;
+      domainMap.set(from, Math.round(0.3 * latency + 0.7 * currentEma));
+    }
 
     // Cache response (success or NXDOMAIN negative caching)
     if (cacheKey) {
@@ -811,7 +867,8 @@ const server = http.createServer(async (req, res) => {
       upstreams: upstreamStates,
       poolSize: currentPoolSize,
       cacheSize: cache.size,
-      uptime: process.uptime()
+      uptime: process.uptime(),
+      aiActivities: aiActivities
     }));
     return;
   }
@@ -1264,6 +1321,12 @@ const server = http.createServer(async (req, res) => {
             margin-top: 50px;
             font-weight: 300;
         }
+
+        @keyframes pulse {
+            0% { transform: scale(0.85); opacity: 0.5; }
+            50% { transform: scale(1.2); opacity: 1; }
+            100% { transform: scale(0.85); opacity: 0.5; }
+        }
     </style>
 </head>
 <body>
@@ -1370,6 +1433,16 @@ const server = http.createServer(async (req, res) => {
                         <p>Mở mục Cài đặt DNS an toàn trên trình duyệt của bạn (Chrome: Bảo mật -> Sử dụng DNS an toàn -> Tùy chỉnh; Firefox: Quyền riêng tư -> DNS qua HTTPS -> Max -> Tùy chỉnh) và dán link DoH vào.</p>
                     </div>
                 </div>
+            </div>
+        </div>
+
+        <div class="main-panel" style="border: 1px solid rgba(0, 247, 255, 0.2); background: rgba(0, 8, 16, 0.5); box-shadow: 0 0 15px rgba(0, 247, 255, 0.05); margin-top: 10px;">
+            <h2 style="color: var(--accent-glow); display: flex; align-items: center; gap: 10px;">
+                <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background-color: var(--accent-solid); box-shadow: 0 0 8px var(--accent-solid); animation: pulse 1.5s infinite;"></span>
+                Nhật ký hoạt động của AI Engine (Markov Predictor & Peering Router)
+            </h2>
+            <div id="ai-log-container" style="max-height: 220px; overflow-y: auto; font-family: monospace; font-size: 0.85rem; padding: 15px; border-radius: 12px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.05); display: flex; flex-direction: column; gap: 8px; scroll-behavior: smooth;">
+                <!-- Renders dynamically -->
             </div>
         </div>
 
@@ -1495,6 +1568,29 @@ const server = http.createServer(async (req, res) => {
                         '</td>';
                     tableBody.appendChild(row);
                 });
+
+                // Render AI Operations Log
+                const aiLog = document.getElementById('ai-log-container');
+                aiLog.innerHTML = '';
+                const activities = data.aiActivities || [];
+                if (activities.length === 0) {
+                    aiLog.innerHTML = '<div style="color: var(--text-muted); text-align: center; padding: 20px;">AI đang phân tích và tối ưu hóa luồng dữ liệu...</div>';
+                } else {
+                    activities.forEach(act => {
+                        let color = '#fff';
+                        if (act.type === 'LEARNER') color = '#a78bfa'; // Purple
+                        else if (act.type === 'PREFETCH') color = '#38bdf8'; // Blue
+                        else if (act.type === 'CACHE') color = '#34d399'; // Green
+                        else if (act.type === 'ROUTER') color = '#fbbf24'; // Yellow
+                        
+                        const div = document.createElement('div');
+                        div.style.lineHeight = '1.5';
+                        div.innerHTML = '<span style="color: var(--text-muted); font-variant-numeric: tabular-nums;">[' + act.time + ']</span> ' +
+                            '<span style="color: ' + color + '; font-weight: bold; margin-right: 5px;">[AI ' + act.type + ']</span> ' +
+                            '<span>' + act.message + '</span>';
+                        aiLog.appendChild(div);
+                    });
+                }
 
             } catch (err) {
                 console.error('Error loading stats:', err);

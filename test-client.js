@@ -128,6 +128,14 @@ async function runTests() {
     console.log(`=> Thời gian phản hồi cdn được prefetch: ${prefetchDuration}ms`);
     if (!resCdn.ok) throw new Error('Query cdn thất bại');
     
+    // Kiểm tra cấu trúc API /api/stats có chứa các hoạt động của AI
+    const aiStatsRes = await fetch(`${url}/api/stats`);
+    const aiStatsObj = await aiStatsRes.json();
+    console.log(`=> Danh sách hoạt động AI ghi nhận được: ${aiStatsObj.aiActivities.length} dòng`);
+    if (!aiStatsObj.aiActivities || aiStatsObj.aiActivities.length === 0) {
+      throw new Error('LỖI: Không tìm thấy ghi chép hoạt động của AI!');
+    }
+    
     console.log('=> TEST 4: PASS');
 
   } catch (err) {
