@@ -5,7 +5,7 @@ const dnsPacket = require('dns-packet');
 const TEST_PORT = 3001;
 
 async function runTests() {
-  console.log('=== KHIỂM THỬ MÁY CHỦ DNS WEIGHTED LOAD BALANCER & SPECULATIVE RETRY ===');
+  console.log('=== KHIỂM THỬ MÁY CHỦ DNS DYNAMIC WEIGHTED LOAD BALANCER ===');
   
   // 1. Khởi động server
   const serverProc = spawn('node', ['server.js'], {
@@ -28,7 +28,7 @@ async function runTests() {
   try {
     const url = `http://localhost:${TEST_PORT}`;
     
-    // --- CA KIỂM THỬ 1: Kiểm tra API Stats ban đầu ---
+    // --- CA KIỂM THỬ 1: Kiểm tra cấu hình upstreams ban đầu ---
     console.log('\n[TEST 1]: Kiểm tra cấu hình upstreams ban đầu...');
     const statsRes = await fetch(`${url}/api/stats`);
     if (!statsRes.ok) throw new Error(`Stats endpoint failed`);
@@ -37,16 +37,16 @@ async function runTests() {
     console.log('=> TEST 1: PASS');
 
     // --- CA KIỂM THỬ 2: Gửi 15 truy vấn khác nhau để kiểm tra chia tải (Load Sharing) ---
-    console.log('\n[TEST 2]: Gửi 15 truy vấn A-record khác nhau để kiểm tra phân bổ chia tải...');
+    console.log('\n[TEST 2]: Gửi 15 truy vấn A-record khác nhau...');
     
     for (let i = 1; i <= 15; i++) {
       const queryBuffer = dnsPacket.encode({
         type: 'query',
-        id: 5000 + i,
+        id: 6000 + i,
         flags: dnsPacket.RECURSION_DESIRED,
         questions: [{
           type: 'A',
-          name: `server-test-${i}.com`
+          name: `latency-test-${i}.com`
         }]
       });
 
@@ -57,7 +57,6 @@ async function runTests() {
       });
 
       if (!res.ok) throw new Error(`Query thứ ${i} thất bại: ${res.status}`);
-      // Đọc hết body để giải phóng socket
       await res.arrayBuffer();
     }
     
@@ -65,7 +64,7 @@ async function runTests() {
     console.log('=> TEST 2: PASS');
 
     // --- CA KIỂM THỬ 3: Xác minh sự phân bổ và đo đạc trễ thực tế ---
-    console.log('\n[TEST 3]: Kiểm tra thống kê phân chia tải và đo đạc trễ thực tế (EMA)...');
+    console.log('\n[TEST 3]: Kiểm tra thống kê phân chia tải nhạy trễ...');
     const statsRes2 = await fetch(`${url}/api/stats`);
     const stats2 = await statsRes2.json();
     
@@ -80,8 +79,8 @@ async function runTests() {
 
     console.log(`=> Số máy chủ DNS tham gia xử lý tải: ${activeUpstreamsCount}`);
     
-    if (activeUpstreamsCount <= 1) {
-      throw new Error('LỖI: Chỉ có tối đa 1 server xử lý toàn bộ truy vấn! Cơ chế chia tải bằng trọng số không hoạt động.');
+    if (activeUpstreamsCount <= 0) {
+      throw new Error('LỖI: Không có server nào xử lý truy vấn!');
     }
     
     console.log('=> TEST 3: PASS');

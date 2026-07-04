@@ -93,22 +93,32 @@ function updateCandidates() {
   activeCandidates = sorted.slice(0, poolSize);
 }
 
-// Select a candidate using weighted probability to distribute load
-// Weights: #1 (60%), #2 (30%), #3 (10%)
+// Dynamic Latency-Sensitive Weighting: Select upstream based on inverse square of scores
+// Keeps fast servers busy (99% queries) and completely bypasses slow ones
 function selectWeightedUpstream(candidates) {
   if (!candidates || candidates.length === 0) return null;
   if (candidates.length === 1) return candidates[0];
 
-  const rand = Math.random();
-  if (candidates.length === 2) {
-    if (rand < 0.7) return candidates[0];
-    return candidates[1];
-  }
+  const weights = candidates.map(c => {
+    const score = Math.max(1, c.score);
+    // Inverse square gives strong priority to lower scores (e.g. 6ms vs 96ms becomes 256x difference)
+    return {
+      candidate: c,
+      value: Math.pow(1000 / score, 2)
+    };
+  });
 
-  // 3 or more candidates
-  if (rand < 0.6) return candidates[0];
-  if (rand < 0.9) return candidates[1];
-  return candidates[2];
+  const totalWeight = weights.reduce((sum, w) => sum + w.value, 0);
+  if (totalWeight <= 0) return candidates[0];
+
+  let rand = Math.random() * totalWeight;
+  for (const w of weights) {
+    rand -= w.value;
+    if (rand <= 0) {
+      return w.candidate;
+    }
+  }
+  return candidates[0];
 }
 
 // In-Memory DNS Cache (Key: name:type:class)
@@ -169,7 +179,6 @@ function pingUpstream(ip) {
   return new Promise((resolve) => {
     const txId = getNextTxId();
     
-    // Use Google A record query (standard & never blocked by upstreams/firewalls)
     const pingPacket = dnsPacket.encode({
       type: 'query',
       id: txId,
@@ -184,7 +193,7 @@ function pingUpstream(ip) {
     const timeout = setTimeout(() => {
       pendingQueries.delete(txId);
       resolve({ success: false, latency: 1000 });
-    }, 1500); // 1.5s timeout
+    }, 1500);
 
     pendingQueries.set(txId, {
       resolve: () => {
@@ -233,7 +242,6 @@ async function performHealthChecks() {
     const lostCount = state.pings.filter(p => p === 1000).length;
     state.lossRate = Math.round((lostCount / state.pings.length) * 100);
 
-    // Decay penalty by 50% on every active health check tick
     state.penalty = Math.max(0, Math.round(state.penalty * 0.5));
 
     state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
@@ -250,13 +258,12 @@ async function performHealthChecks() {
   updateCandidates();
 }
 
-// Perform initial check, set candidates list and schedule every 25 seconds
 performHealthChecks().then(() => {
   updateCandidates();
 });
 setInterval(performHealthChecks, 25000);
 
-// Perform DNS routing using Weighted Load Balancing + Speculative Backup Retry (150ms delay)
+// Perform DNS routing using Dynamic Weighted Load Balancing + Speculative Backup Retry (Dynamic delay)
 function raceDNS(queryBuffer, timeoutMs = 1200) {
   return new Promise((resolve, reject) => {
     const candidates = activeCandidates;
@@ -273,7 +280,7 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
 
     const startTime = Date.now();
 
-    // Select the primary upstream based on weights
+    // Select primary dynamically by weights
     const primary = selectWeightedUpstream(candidates);
     let backupStarted = false;
     let backupTimer = null;
@@ -282,7 +289,6 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
       pendingQueries.delete(myTxId);
       if (backupTimer) clearTimeout(backupTimer);
 
-      // Apply timeout penalties
       const queried = backupStarted ? candidates : [primary];
       queried.forEach(state => {
         state.realErrorsCount++;
@@ -338,25 +344,27 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
       timeout
     });
 
-    // Send query to the selected primary first
+    // Send query to primary
     udpSocket.send(upstreamQuery, 0, upstreamQuery.length, 53, primary.ip, (err) => {
       if (err) {
-        // If sending to primary fails instantly, trigger backup immediately
         if (backupTimer) clearTimeout(backupTimer);
         triggerBackup();
       }
     });
 
-    // Set speculative backup retry timer (150ms)
+    // Dynamic Speculative Backup Delay: wait only 1.3x of primary's latency (min 20ms, max 200ms)
+    // If primary has 6ms ping, we wait only 20ms to backup, ensuring ultra-responsive failover
+    const backupDelay = Math.max(20, Math.min(200, Math.round(primary.avgLatency * 1.3)));
+    
     backupTimer = setTimeout(() => {
       triggerBackup();
-    }, 150);
+    }, backupDelay);
 
     function triggerBackup() {
       if (backupStarted) return;
       backupStarted = true;
 
-      // Send query in parallel to the remaining candidates
+      // Send to remaining candidates
       candidates.forEach(state => {
         if (state.ip !== primary.ip) {
           udpSocket.send(upstreamQuery, 0, upstreamQuery.length, 53, state.ip, (err) => {
@@ -946,7 +954,7 @@ const server = http.createServer(async (req, res) => {
 
         .btn-download:hover {
             transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(0, 242, 254, 0.25);
+            box-shadow: 0 5px 15px rgba(0, 247, 255, 0.25);
         }
 
         .table-container {
@@ -1085,6 +1093,12 @@ const server = http.createServer(async (req, res) => {
 </head>
 <body>
     <div class="container">
+        <!-- Latency Warning Banner for Singapore Region Recommendation -->
+        <div id="latency-warning-banner" style="display: none; background: linear-gradient(135deg, #ff453a 0%, #ff9f0a 100%); color: #000; padding: 15px 20px; text-align: center; font-weight: 600; font-size: 0.95rem; border-radius: 12px; margin-bottom: 25px; box-shadow: 0 5px 15px rgba(255, 69, 58, 0.2);">
+            ⚠️ CẢNH BÁO ĐỘ TRỄ CAO: Kết nối từ thiết bị của bạn đến máy chủ Render hiện tại là <span id="client-latency-val">0</span>ms (ì ạch). 
+            Hãy chuyển vùng (region) của Web Service trên Render sang <strong>Singapore (SG)</strong> để tối ưu hóa RTT xuống 30-40ms!
+        </div>
+
         <header>
             <h1>Antigravity Hyper-Speed DNS</h1>
             <p>Định tuyến thích ứng EMA, tối ưu hoá bộ nhớ đệm SWR & Racing Pool thông minh</p>
@@ -1209,10 +1223,22 @@ const server = http.createServer(async (req, res) => {
         }
 
         async function fetchStats() {
+            const startTime = Date.now();
             try {
                 const res = await fetch('/api/stats');
+                const clientLatency = Date.now() - startTime;
                 const data = await res.json();
                 
+                // Show region warning banner if device-to-server RTT is too high
+                const banner = document.getElementById('latency-warning-banner');
+                const latVal = document.getElementById('client-latency-val');
+                if (clientLatency > 120) {
+                    banner.style.display = 'block';
+                    latVal.innerText = clientLatency;
+                } else {
+                    banner.style.display = 'none';
+                }
+
                 document.getElementById('total-queries').innerText = data.totalQueries.toLocaleString();
                 const hitRate = data.totalQueries > 0 ? Math.round((data.cacheHits / data.totalQueries) * 100) : 0;
                 document.getElementById('cache-hit-rate').innerHTML = hitRate + '<span class="stat-unit">%</span>';
