@@ -71,11 +71,9 @@ function updateCandidates() {
     const gap1to2 = sorted[1].avgLatency - sorted[0].avgLatency;
     const gap1to3 = sorted[2].avgLatency - sorted[0].avgLatency;
     
-    // If the top 3 pings are very close, race 3 servers to find the absolute fastest
     if (gap1to3 < 20 || gap1to2 < 12) {
       poolSize = 3;
     }
-    // If any of the top 3 has packet loss, increase pool size to 3 for redundancy
     if (sorted[0].lossRate > 0 || sorted[1].lossRate > 0 || sorted[2].lossRate > 0) {
       poolSize = 3;
     }
@@ -85,7 +83,6 @@ function updateCandidates() {
     const gap1to4 = sorted[3].avgLatency - sorted[0].avgLatency;
     const hasWarning = sorted.slice(0, 3).some(s => s.status === 'Warning');
     
-    // If there's network instability or candidate #4 is also very close, race 4 servers
     if (hasWarning || gap1to4 < 15) {
       poolSize = 4;
     }
@@ -98,6 +95,9 @@ function updateCandidates() {
 
 // In-Memory DNS Cache (Key: name:type:class)
 const cache = new Map();
+
+// Active background revalidations to prevent duplicate requests
+const activeRevalidations = new Set();
 
 // Active Pending Upstream Queries (UDP mapping)
 const pendingQueries = new Map();
@@ -125,6 +125,17 @@ udpSocket.on('error', (err) => {
   console.error('UDP socket error:', err);
 });
 
+// Explicitly bind the UDP socket and expand receive/send buffers to 1MB to prevent packet drops under load
+udpSocket.bind(0, () => {
+  try {
+    udpSocket.setRecvBufferSize(1024 * 1024);
+    udpSocket.setSendBufferSize(1024 * 1024);
+    console.log('UDP Socket buffer sizes successfully expanded to 1MB.');
+  } catch (err) {
+    console.warn('Could not set UDP socket buffer sizes:', err.message);
+  }
+});
+
 // Unique transaction ID generator
 function getNextTxId() {
   let id = nextTxId;
@@ -135,18 +146,19 @@ function getNextTxId() {
   return id;
 }
 
-// Active Health Check: Ping an upstream with a lightweight query
+// Active Health Check: Ping an upstream with a standard, universally supported A-record query for google.com
 function pingUpstream(ip) {
   return new Promise((resolve) => {
     const txId = getNextTxId();
     
+    // Use Google A record query (standard & never blocked by upstreams/firewalls)
     const pingPacket = dnsPacket.encode({
       type: 'query',
       id: txId,
       flags: dnsPacket.RECURSION_DESIRED,
       questions: [{
-        type: 'SOA',
-        name: '.'
+        type: 'A',
+        name: 'google.com'
       }]
     });
 
@@ -154,7 +166,7 @@ function pingUpstream(ip) {
     const timeout = setTimeout(() => {
       pendingQueries.delete(txId);
       resolve({ success: false, latency: 1000 });
-    }, 1500);
+    }, 1500); // 1.5s timeout
 
     pendingQueries.set(txId, {
       resolve: () => {
@@ -226,8 +238,8 @@ performHealthChecks().then(() => {
 });
 setInterval(performHealthChecks, 25000);
 
-// Perform DNS racing on adaptive candidates
-function raceDNS(queryBuffer, timeoutMs = 3000) {
+// Perform DNS racing on adaptive candidates (Tuned timeout to 1200ms to clear queues fast and prevent congestion)
+function raceDNS(queryBuffer, timeoutMs = 1200) {
   return new Promise((resolve, reject) => {
     const candidates = activeCandidates;
     const originalTxId = queryBuffer.readUInt16BE(0);
@@ -241,6 +253,7 @@ function raceDNS(queryBuffer, timeoutMs = 3000) {
     const timeout = setTimeout(() => {
       pendingQueries.delete(myTxId);
       
+      // Apply timeout penalties
       candidates.forEach(state => {
         state.realErrorsCount++;
         state.penalty = Math.min(1000, state.penalty + 250);
@@ -362,7 +375,7 @@ setInterval(() => {
   }
 }, 120000);
 
-// Core DNS-over-HTTPS request processor (Optimized with SWR Caching)
+// Core DNS-over-HTTPS request processor (Optimized with SWR Caching & Deduplication)
 async function handleDoH(queryBuffer) {
   const startTime = Date.now();
   stats.totalQueries++;
@@ -393,8 +406,10 @@ async function handleDoH(queryBuffer) {
         const remainingTtl = cachedEntry.originalTtl - ageSec;
         const shouldRevalidate = (ageSec > cachedEntry.originalTtl * 0.7) || (remainingTtl < 15);
 
-        if (shouldRevalidate) {
+        if (shouldRevalidate && !activeRevalidations.has(cacheKey)) {
           stats.swrHits++;
+          activeRevalidations.add(cacheKey); // Deduplicate background revalidations to prevent congestion
+          
           // Trigger asynchronous background revalidation
           setTimeout(() => {
             raceDNS(queryBuffer)
@@ -414,6 +429,9 @@ async function handleDoH(queryBuffer) {
               })
               .catch(() => {
                 // Ignore query failures in background
+              })
+              .finally(() => {
+                activeRevalidations.delete(cacheKey); // Release lock
               });
           }, 0);
         } else {
@@ -426,7 +444,6 @@ async function handleDoH(queryBuffer) {
 
         return responseBuffer;
       } else {
-        // Cache expired, delete it
         cache.delete(cacheKey);
       }
     }
@@ -440,7 +457,7 @@ async function handleDoH(queryBuffer) {
     stats.totalLatency += latency;
     stats.averageLatency = stats.totalLatency / stats.totalQueries;
 
-    // Cache successful response (recording cachedAt and originalTtl for SWR)
+    // Cache successful response
     if (cacheKey) {
       try {
         const dnsRespObj = dnsPacket.decode(responseBuffer);
@@ -1080,7 +1097,7 @@ const server = http.createServer(async (req, res) => {
                     </div>
                     <div class="device-content">
                         <p>Nhấp vào nút bên dưới để tải và cài đặt profile hệ thống:</p>
-                        <a href="/download-profile" class="btn-download">Tải Profile Cấu Hìn (.mobileconfig)</a>
+                        <a href="/download-profile" class="btn-download">Tải Profile Cấu Hình (.mobileconfig)</a>
                         <p style="margin-top: 15px; font-size: 0.9rem; color: var(--text-muted);">
                             <strong>Tính năng bảo mật nâng cao:</strong><br>
                             • <strong>Ép buộc điều tuyến (Prohibit Fallback)</strong>: Gom và buộc 100% truy vấn DNS đi qua máy chủ DoH, ngăn chặn việc rò rỉ (leak) ra DNS mặc định của Wi-Fi hay nhà mạng di động.<br>
@@ -1232,6 +1249,6 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Antigravity Hyper-Speed DNS Server running on http://localhost:${PORT}`);
-  console.log(`DNS health-check active monitoring started.`);
+  console.log("Antigravity Hyper-Speed DNS Server running on http://localhost:" + PORT);
+  console.log("DNS health-check active monitoring started.");
 });
