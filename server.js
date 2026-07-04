@@ -453,6 +453,88 @@ setInterval(() => {
   }
 }, 120000);
 
+// Lightweight AI Markov Chain Behavior Predictor for DNS Prefetching
+const transitionModel = new Map(); // domainA -> Map(domainB -> count)
+let lastDomainName = null;
+let lastDomainTime = 0;
+
+function recordTransition(prev, current) {
+  if (!prev || !current || prev === current) return;
+  
+  let nextMap = transitionModel.get(prev);
+  if (!nextMap) {
+    nextMap = new Map();
+    transitionModel.set(prev, nextMap);
+  }
+  
+  const count = nextMap.get(current) || 0;
+  nextMap.set(current, count + 1);
+  
+  // Keep memory bounded: limit next list to 5 items max per node
+  if (nextMap.size > 5) {
+    let lowestKey = null;
+    let lowestVal = Infinity;
+    for (const [k, v] of nextMap.entries()) {
+      if (v < lowestVal) {
+        lowestVal = v;
+        lowestKey = k;
+      }
+    }
+    if (lowestKey) nextMap.delete(lowestKey);
+  }
+}
+
+function predictAndPrefetch(currentDomain) {
+  const nextMap = transitionModel.get(currentDomain);
+  if (!nextMap) return;
+  
+  // Find top predictions
+  const sortedNext = [...nextMap.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 2); // Prefetch top 2 domains
+    
+  for (const [nextDomain, count] of sortedNext) {
+    if (count >= 3) { // Proactive threshold: 3 hits
+      const cacheKey = `${nextDomain}:1:IN`; // A-record cache key
+      if (!cache.has(cacheKey) && !activeRevalidations.has(cacheKey)) {
+        activeRevalidations.add(cacheKey);
+        
+        const prefetchPacket = dnsPacket.encode({
+          type: 'query',
+          id: Math.floor(Math.random() * 65535),
+          flags: dnsPacket.RECURSION_DESIRED,
+          questions: [{
+            type: 'A',
+            name: nextDomain
+          }]
+        });
+        
+        raceDNS(prefetchPacket)
+          .then(({ responseBuffer }) => {
+            try {
+              const dnsRespObj = dnsPacket.decode(responseBuffer);
+              const ttl = getMinTTL(dnsRespObj);
+              
+              const isNxDomain = dnsRespObj.rcode === 'NXDOMAIN';
+              const cacheTtl = isNxDomain ? 30 : ttl;
+
+              cache.set(cacheKey, {
+                buffer: responseBuffer,
+                cachedAt: Date.now(),
+                originalTtl: cacheTtl,
+                expiresAt: Date.now() + cacheTtl * 1000
+              });
+            } catch (e) {}
+          })
+          .catch(() => {})
+          .finally(() => {
+            activeRevalidations.delete(cacheKey);
+          });
+      }
+    }
+  }
+}
+
 function isValidPublicIp(ip) {
   if (!ip) return false;
   if (ip.startsWith('127.') || ip.startsWith('10.') || ip.startsWith('192.168.')) return false;
@@ -478,6 +560,24 @@ async function handleDoH(queryBuffer, clientIp) {
   } catch (err) {
     stats.errors++;
     throw new Error('Format Error: Failed to parse DNS query');
+  }
+
+  // Lightweight AI Behavior Predictor: link queries and proactively prefetch next domains
+  if (dnsQueryObj.questions && dnsQueryObj.questions.length > 0) {
+    try {
+      const currentName = dnsQueryObj.questions[0].name.toLowerCase();
+      const now = Date.now();
+      
+      if (lastDomainName && (now - lastDomainTime < 5000)) {
+        recordTransition(lastDomainName, currentName);
+      }
+      lastDomainName = currentName;
+      lastDomainTime = now;
+      
+      predictAndPrefetch(currentName);
+    } catch (e) {
+      // Silently catch to avoid crashing critical path
+    }
   }
 
   // EDNS Client Subnet (ECS) Routing: Inject client's real public IP prefix to allow upstreams/CDNs 

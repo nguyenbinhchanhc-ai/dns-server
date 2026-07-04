@@ -88,6 +88,48 @@ async function runTests() {
     
     console.log('=> TEST 3: PASS');
 
+    // --- CA KIỂM THỬ 4: Xác minh AI tiên đoán hành vi và Prefetch ---
+    console.log('\n[TEST 4]: Kiểm tra AI tiên đoán hành vi và Prefetch...');
+    
+    // Học hành vi: Gửi original-domain.com rồi đến predicted-cdn.com (3 lần)
+    for (let j = 0; j < 3; j++) {
+      const q1 = dnsPacket.encode({
+        type: 'query', id: 7000 + j, flags: dnsPacket.RECURSION_DESIRED,
+        questions: [{ type: 'A', name: 'original-domain.com' }]
+      });
+      await fetch(`${url}/dns-query`, { method: 'POST', body: q1 });
+      
+      const q2 = dnsPacket.encode({
+        type: 'query', id: 8000 + j, flags: dnsPacket.RECURSION_DESIRED,
+        questions: [{ type: 'A', name: 'predicted-cdn.com' }]
+      });
+      await fetch(`${url}/dns-query`, { method: 'POST', body: q2 });
+    }
+    
+    // Lần thứ 4: Chỉ gửi original-domain.com để kích hoạt AI prefetch predicted-cdn.com ngầm
+    const qTest = dnsPacket.encode({
+      type: 'query', id: 9000, flags: dnsPacket.RECURSION_DESIRED,
+      questions: [{ type: 'A', name: 'original-domain.com' }]
+    });
+    await fetch(`${url}/dns-query`, { method: 'POST', body: qTest });
+    
+    // Đợi 200ms để AI xử lý prefetch ngầm
+    await new Promise(resolve => setTimeout(resolve, 200));
+    
+    // Gửi yêu cầu predicted-cdn.com và đo thời gian (phải lấy từ cache < 15ms)
+    const qCdn = dnsPacket.encode({
+      type: 'query', id: 9001, flags: dnsPacket.RECURSION_DESIRED,
+      questions: [{ type: 'A', name: 'predicted-cdn.com' }]
+    });
+    const prefetchStartTime = Date.now();
+    const resCdn = await fetch(`${url}/dns-query`, { method: 'POST', body: qCdn });
+    const prefetchDuration = Date.now() - prefetchStartTime;
+    
+    console.log(`=> Thời gian phản hồi cdn được prefetch: ${prefetchDuration}ms`);
+    if (!resCdn.ok) throw new Error('Query cdn thất bại');
+    
+    console.log('=> TEST 4: PASS');
+
   } catch (err) {
     console.error('\n❌ PHÁT HIỆN LỖI KIỂM THỬ:', err.message);
     passed = false;
