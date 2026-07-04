@@ -453,8 +453,22 @@ setInterval(() => {
   }
 }, 120000);
 
-// Core DNS-over-HTTPS request processor (Optimized with SWR Caching & Deduplication)
-async function handleDoH(queryBuffer) {
+function isValidPublicIp(ip) {
+  if (!ip) return false;
+  if (ip.startsWith('127.') || ip.startsWith('10.') || ip.startsWith('192.168.')) return false;
+  if (ip.startsWith('172.')) {
+    const parts = ip.split('.');
+    if (parts.length >= 2) {
+      const second = parseInt(parts[1], 10);
+      if (second >= 16 && second <= 31) return false;
+    }
+  }
+  if (ip === '::1' || ip === 'localhost' || ip.startsWith('fe80:') || ip.startsWith('fc00:') || ip.startsWith('fd00:')) return false;
+  return true;
+}
+
+// Core DNS-over-HTTPS request processor (Optimized with SWR Caching, Deduplication, and ECS injection)
+async function handleDoH(queryBuffer, clientIp) {
   const startTime = Date.now();
   stats.totalQueries++;
 
@@ -464,6 +478,48 @@ async function handleDoH(queryBuffer) {
   } catch (err) {
     stats.errors++;
     throw new Error('Format Error: Failed to parse DNS query');
+  }
+
+  // EDNS Client Subnet (ECS) Routing: Inject client's real public IP prefix to allow upstreams/CDNs 
+  // to route the client to the closest local edge servers (Viettel, FPT, VNPT caches inside Vietnam)
+  if (isValidPublicIp(clientIp)) {
+    try {
+      let optRecord = dnsQueryObj.additionals ? dnsQueryObj.additionals.find(r => r.type === 'OPT') : null;
+      let hasChange = false;
+
+      if (!optRecord) {
+        optRecord = {
+          type: 'OPT',
+          name: '.',
+          udpPayloadSize: 4096,
+          options: []
+        };
+        if (!dnsQueryObj.additionals) dnsQueryObj.additionals = [];
+        dnsQueryObj.additionals.push(optRecord);
+        hasChange = true;
+      }
+
+      // Check if CLIENT_SUBNET option already exists
+      const hasEcs = optRecord.options && optRecord.options.some(o => o.code === 'CLIENT_SUBNET' || o.code === 8);
+      if (!hasEcs) {
+        if (!optRecord.options) optRecord.options = [];
+        const isIpv6 = clientIp.includes(':');
+        optRecord.options.push({
+          code: 'CLIENT_SUBNET',
+          family: isIpv6 ? 2 : 1,
+          sourcePrefixLength: isIpv6 ? 48 : 24,
+          scopePrefixLength: 0,
+          ip: clientIp
+        });
+        hasChange = true;
+      }
+
+      if (hasChange) {
+        queryBuffer = dnsPacket.encode(dnsQueryObj);
+      }
+    } catch (e) {
+      // Catch silently to avoid crash on malformed query buffers
+    }
   }
 
   const cacheKey = getCacheKey(dnsQueryObj);
@@ -495,11 +551,15 @@ async function handleDoH(queryBuffer) {
                 try {
                   const dnsRespObj = dnsPacket.decode(responseBuffer);
                   const ttl = getMinTTL(dnsRespObj);
+                  
+                  const isNxDomain = dnsRespObj.rcode === 'NXDOMAIN';
+                  const cacheTtl = isNxDomain ? 30 : ttl;
+
                   cache.set(cacheKey, {
                     buffer: responseBuffer,
                     cachedAt: Date.now(),
-                    originalTtl: ttl,
-                    expiresAt: Date.now() + ttl * 1000
+                    originalTtl: cacheTtl,
+                    expiresAt: Date.now() + cacheTtl * 1000
                   });
                 } catch (e) {
                   // Ignore parse error in background revalidation
@@ -535,16 +595,20 @@ async function handleDoH(queryBuffer) {
     stats.totalLatency += latency;
     stats.averageLatency = stats.totalLatency / stats.totalQueries;
 
-    // Cache successful response
+    // Cache response (success or NXDOMAIN negative caching)
     if (cacheKey) {
       try {
         const dnsRespObj = dnsPacket.decode(responseBuffer);
         const ttl = getMinTTL(dnsRespObj);
+        
+        const isNxDomain = dnsRespObj.rcode === 'NXDOMAIN';
+        const cacheTtl = isNxDomain ? 30 : ttl; // Cache NXDOMAIN for 30 seconds
+
         cache.set(cacheKey, {
           buffer: responseBuffer,
           cachedAt: Date.now(),
-          originalTtl: ttl,
-          expiresAt: Date.now() + ttl * 1000
+          originalTtl: cacheTtl,
+          expiresAt: Date.now() + cacheTtl * 1000
         });
       } catch (e) {
         // Non-fatal cache failure
@@ -585,6 +649,10 @@ const server = http.createServer(async (req, res) => {
 
   // Endpoint 1: DoH Handler
   if (parsedUrl.pathname === '/dns-query') {
+    const clientIp = req.headers['x-forwarded-for']
+      ? req.headers['x-forwarded-for'].split(',')[0].trim()
+      : req.socket.remoteAddress;
+
     if (req.method === 'GET') {
       const dnsParam = parsedUrl.searchParams.get('dns');
       if (!dnsParam) {
@@ -594,7 +662,7 @@ const server = http.createServer(async (req, res) => {
       }
       try {
         const queryBuffer = base64urlDecode(dnsParam);
-        const responseBuffer = await handleDoH(queryBuffer);
+        const responseBuffer = await handleDoH(queryBuffer, clientIp);
         res.writeHead(200, {
           'Content-Type': 'application/dns-message',
           'Content-Length': responseBuffer.length,
@@ -616,7 +684,7 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         try {
-          const responseBuffer = await handleDoH(queryBuffer);
+          const responseBuffer = await handleDoH(queryBuffer, clientIp);
           res.writeHead(200, {
             'Content-Type': 'application/dns-message',
             'Content-Length': responseBuffer.length,

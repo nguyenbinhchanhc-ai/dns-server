@@ -52,7 +52,10 @@ async function runTests() {
 
       const res = await fetch(`${url}/dns-query`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/dns-message' },
+        headers: { 
+          'Content-Type': 'application/dns-message',
+          'X-Forwarded-For': '27.72.12.34' // Simulate client from Vietnam (Viettel IP)
+        },
         body: queryBuffer
       });
 
