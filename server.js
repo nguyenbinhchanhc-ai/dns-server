@@ -97,8 +97,14 @@ function updateCandidates() {
 const aiActivities = [];
 
 function logAiActivity(type, message) {
+  const d = new Date();
+  const h = String(d.getHours()).padStart(2, '0');
+  const m = String(d.getMinutes()).padStart(2, '0');
+  const s = String(d.getSeconds()).padStart(2, '0');
+  const timeStr = `${h}:${m}:${s}`;
+
   aiActivities.unshift({
-    time: new Date().toLocaleTimeString('vi-VN'),
+    time: timeStr,
     type,
     message
   });
@@ -128,7 +134,10 @@ function selectWeightedUpstream(candidates, domain) {
       
       const now = Date.now();
       if (now - lastRouterLogTime > 4000 && !loggedRouter) {
-        logAiActivity('ROUTER', `Định tuyến AI: ${domain} ➔ ${c.name} (Tối ưu lịch sử: ${histLat}ms)`);
+        const dnsName = c.name;
+        setImmediate(() => {
+          logAiActivity('ROUTER', `Định tuyến AI: ${domain} ➔ ${dnsName} (Tối ưu lịch sử: ${histLat}ms)`);
+        });
         lastRouterLogTime = now;
         loggedRouter = true;
       }
@@ -609,20 +618,22 @@ async function handleDoH(queryBuffer, clientIp) {
     ? dnsQueryObj.questions[0].name.toLowerCase()
     : null;
 
-  // Lightweight AI Behavior Predictor: link queries and proactively prefetch next domains
+  // Lightweight AI Behavior Predictor: defer learning and prefetching asynchronously via setImmediate
   if (domain) {
-    try {
-      const now = Date.now();
-      if (lastDomainName && (now - lastDomainTime < 5000)) {
-        recordTransition(lastDomainName, domain);
+    setImmediate(() => {
+      try {
+        const now = Date.now();
+        if (lastDomainName && (now - lastDomainTime < 5000)) {
+          recordTransition(lastDomainName, domain);
+        }
+        lastDomainName = domain;
+        lastDomainTime = now;
+        
+        predictAndPrefetch(domain);
+      } catch (e) {
+        // Silently catch to avoid crashing critical path
       }
-      lastDomainName = domain;
-      lastDomainTime = now;
-      
-      predictAndPrefetch(domain);
-    } catch (e) {
-      // Silently catch to avoid crashing critical path
-    }
+    });
   }
 
   // EDNS Client Subnet (ECS) Routing: Inject client's real public IP prefix to allow upstreams/CDNs 
