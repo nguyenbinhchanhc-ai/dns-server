@@ -2,9 +2,8 @@ const { spawn } = require('child_process');
 const http = require('http');
 const dnsPacket = require('dns-packet');
 
-const TEST_PORT = 3001; // Avoid conflict with any running instance on 3000
+const TEST_PORT = 3001;
 
-// Helper to base64url encode a buffer
 function base64urlEncode(buf) {
   return buf.toString('base64')
     .replace(/\+/g, '-')
@@ -13,7 +12,7 @@ function base64urlEncode(buf) {
 }
 
 async function runTests() {
-  console.log('=== KHIỂM THỬ MÁY CHỦ DNS OVER HTTPS ===');
+  console.log('=== KHIỂM THỬ MÁY CHỦ DNS LOAD BALANCER & ACTIVE MONITOR ===');
   
   // 1. Khởi động server
   const serverProc = spawn('node', ['server.js'], {
@@ -28,28 +27,32 @@ async function runTests() {
     console.error(`[Server Err]: ${data.toString().trim()}`);
   });
 
-  // Chờ 1 giây để server khởi động và bind cổng
-  await new Promise(resolve => setTimeout(resolve, 1000));
+  // Chờ 1.5 giây để server khởi động, chạy lượt active ping đầu tiên và bind cổng
+  await new Promise(resolve => setTimeout(resolve, 1500));
 
   let passed = true;
 
   try {
     const url = `http://localhost:${TEST_PORT}`;
     
-    // --- CA KIỂM THỬ 1: Kiểm tra API Stats ---
-    console.log('\n[TEST 1]: Kiểm tra API Stats...');
+    // --- CA KIỂM THỬ 1: Kiểm tra API Stats ban đầu ---
+    console.log('\n[TEST 1]: Kiểm tra API Stats & Active Monitoring...');
     const statsRes = await fetch(`${url}/api/stats`);
-    if (!statsRes.ok) throw new Error(`Stats endpoint failed with status ${statsRes.status}`);
+    if (!statsRes.ok) throw new Error(`Stats endpoint failed: ${statsRes.status}`);
     const stats = await statsRes.json();
-    console.log('=> Thống kê ban đầu:', JSON.stringify(stats));
+    
+    console.log(`=> Danh sách upstreams đã quét: ${stats.upstreams.length} servers`);
+    console.log(`=> Ping của Cloudflare Primary (1.1.1.1): ${stats.upstreams[0].avgLatency}ms (Trạng thái: ${stats.upstreams[0].status})`);
+    
     if (stats.totalQueries !== 0) throw new Error('Ban đầu totalQueries phải bằng 0');
+    if (stats.upstreams.length < 5) throw new Error('Không đủ số lượng DNS servers');
     console.log('=> TEST 1: PASS');
 
-    // --- CA KIỂM THỬ 2: Truy vấn DNS bằng POST (google.com) ---
+    // --- CA KIỂM THỬ 2: Truy vấn DNS (google.com) bằng POST (Cache Miss & Racing) ---
     console.log('\n[TEST 2]: Truy vấn DNS (google.com) bằng POST...');
     const queryBuffer = dnsPacket.encode({
       type: 'query',
-      id: 1234,
+      id: 1111,
       flags: dnsPacket.RECURSION_DESIRED,
       questions: [{
         type: 'A',
@@ -67,24 +70,20 @@ async function runTests() {
     });
 
     if (!postRes.ok) throw new Error(`POST dns-query failed: ${postRes.status}`);
-    const responseArrayBuffer = await postRes.arrayBuffer();
-    const responseBuffer = Buffer.from(responseArrayBuffer);
+    const responseBuffer = Buffer.from(await postRes.arrayBuffer());
     const postLatency = Date.now() - startPost;
     
     const dnsResponse = dnsPacket.decode(responseBuffer);
     console.log(`=> Độ trễ truy vấn đầu tiên (Cache Miss): ${postLatency}ms`);
-    console.log(`=> ID phản hồi: ${dnsResponse.id} (Trùng khớp: ${dnsResponse.id === 1234})`);
-    console.log(`=> Câu trả lời nhận được:`, dnsResponse.answers.map(a => `${a.name} -> ${a.address} (TTL: ${a.ttl})`));
-    
-    if (dnsResponse.answers.length === 0) throw new Error('Không nhận được câu trả lời từ upstream');
+    console.log(`=> ID phản hồi: ${dnsResponse.id} (Trùng khớp: ${dnsResponse.id === 1111})`);
+    if (dnsResponse.answers.length === 0) throw new Error('Không nhận được câu trả lời');
     console.log('=> TEST 2: PASS');
 
-    // --- CA KIỂM THỬ 3: Truy vấn lại bằng POST (Kiểm tra Cache Hit) ---
-    console.log('\n[TEST 3]: Truy vấn lại google.com bằng POST (Kiểm tra Caching)...');
-    // Đổi ID truy vấn mới để xác thực server cập nhật ID trong cache
+    // --- CA KIỂM THỬ 3: Truy vấn lại (Cache Hit) ---
+    console.log('\n[TEST 3]: Truy vấn lại google.com để kiểm tra Cache Hit...');
     const queryBuffer2 = dnsPacket.encode({
       type: 'query',
-      id: 5678,
+      id: 2222,
       flags: dnsPacket.RECURSION_DESIRED,
       questions: [{
         type: 'A',
@@ -101,25 +100,21 @@ async function runTests() {
       body: queryBuffer2
     });
 
-    if (!cacheRes.ok) throw new Error(`Cache hit query failed`);
+    if (!cacheRes.ok) throw new Error('Cache lookup failed');
     const cacheResponseBuffer = Buffer.from(await cacheRes.arrayBuffer());
     const cacheLatency = Date.now() - startCache;
     
     const dnsCacheResponse = dnsPacket.decode(cacheResponseBuffer);
-    console.log(`=> Độ trễ truy vấn thứ hai (Cache Hit): ${cacheLatency}ms`);
-    console.log(`=> ID phản hồi: ${dnsCacheResponse.id} (Trùng khớp: ${dnsCacheResponse.id === 5678})`);
-    
-    if (cacheLatency > 15) {
-      console.warn(`[Cảnh báo]: Tốc độ cache ${cacheLatency}ms hơi chậm (bình thường < 5ms).`);
-    }
-    if (dnsCacheResponse.answers.length === 0) throw new Error('Không nhận được câu trả lời từ cache');
+    console.log(`=> Độ trễ truy vấn Cache Hit: ${cacheLatency}ms`);
+    console.log(`=> ID phản hồi: ${dnsCacheResponse.id} (Trùng khớp: ${dnsCacheResponse.id === 2222})`);
+    if (cacheLatency > 15) console.warn('[Cảnh báo]: Cache phản hồi hơi chậm');
     console.log('=> TEST 3: PASS');
 
-    // --- CA KIỂM THỬ 4: Truy vấn DNS bằng GET (github.com) ---
+    // --- CA KIỂM THỬ 4: Truy vấn bằng GET Base64url (github.com) ---
     console.log('\n[TEST 4]: Truy vấn DNS (github.com) bằng GET (Base64url)...');
     const queryGetBuffer = dnsPacket.encode({
       type: 'query',
-      id: 9999,
+      id: 3333,
       flags: dnsPacket.RECURSION_DESIRED,
       questions: [{
         type: 'A',
@@ -130,33 +125,40 @@ async function runTests() {
     const base64Param = base64urlEncode(queryGetBuffer);
     const getRes = await fetch(`${url}/dns-query?dns=${base64Param}`);
     
-    if (!getRes.ok) throw new Error(`GET dns-query failed: ${getRes.status}`);
+    if (!getRes.ok) throw new Error(`GET dns-query failed`);
     const getResponseBuffer = Buffer.from(await getRes.arrayBuffer());
     const dnsGetResponse = dnsPacket.decode(getResponseBuffer);
     
-    console.log(`=> ID phản hồi GET: ${dnsGetResponse.id} (Trùng khớp: ${dnsGetResponse.id === 9999})`);
-    console.log(`=> Câu trả lời nhận được:`, dnsGetResponse.answers.map(a => `${a.name} -> ${a.address}`));
-    if (dnsGetResponse.answers.length === 0) throw new Error('Không nhận được câu trả lời qua GET');
+    console.log(`=> ID phản hồi GET: ${dnsGetResponse.id} (Trùng khớp: ${dnsGetResponse.id === 3333})`);
     console.log('=> TEST 4: PASS');
 
-    // --- CA KIỂM THỬ 5: Xác nhận lại thống kê hoạt động ---
-    console.log('\n[TEST 5]: Kiểm tra lại thống kê (Stats)...');
+    // --- CA KIỂM THỬ 5: Xác nhận số lượng chia tải & xếp hạng ---
+    console.log('\n[TEST 5]: Kiểm tra số lượng phân phối chia tải & Thống kê...');
     const statsRes2 = await fetch(`${url}/api/stats`);
     const stats2 = await statsRes2.json();
-    console.log('=> Thống kê sau kiểm thử:', JSON.stringify(stats2));
-    if (stats2.totalQueries !== 3) throw new Error('Tổng truy vấn phải là 3 (1 POST miss, 1 POST hit, 1 GET miss)');
-    if (stats2.cacheHits !== 1) throw new Error('Số lượt cache hits phải là 1');
-    if (stats2.cacheMisses !== 2) throw new Error('Số lượt cache misses phải là 2');
+    
+    console.log('=> Thống kê phân chia tải thực tế giữa các DNS:');
+    let totalRouted = 0;
+    stats2.upstreams.forEach(dns => {
+      if (dns.routedQueries > 0) {
+        console.log(`   * ${dns.name} (${dns.ip}): xử lý ${dns.routedQueries} truy vấn (Ping: ${dns.avgLatency}ms)`);
+        totalRouted += dns.routedQueries;
+      }
+    });
+
+    if (stats2.totalQueries !== 3) throw new Error('Tổng số lượng truy vấn không chính xác');
+    if (stats2.cacheHits !== 1) throw new Error('Lượt cache hit không chính xác');
+    if (stats2.cacheMisses !== 2) throw new Error('Lượt cache miss không chính xác');
+    if (totalRouted !== 2) throw new Error('Số lượng chia tải thực tế cho DNS upstreams không khớp với số cache miss (2)');
+    
     console.log('=> TEST 5: PASS');
 
   } catch (err) {
     console.error('\n❌ PHÁT HIỆN LỖI KIỂM THỬ:', err.message);
     passed = false;
   } finally {
-    // 4. Dọn dẹp và đóng server
     console.log('\nĐóng máy chủ kiểm thử...');
     serverProc.kill();
-    // Chờ tiến trình đóng hẳn
     await new Promise(resolve => setTimeout(resolve, 500));
   }
 

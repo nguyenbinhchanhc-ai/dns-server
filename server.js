@@ -3,12 +3,19 @@ const dgram = require('dgram');
 const dnsPacket = require('dns-packet');
 
 const PORT = process.env.PORT || 3000;
+
+// Expanded Upstream DNS Servers List
 const UPSTREAMS = [
-  '1.1.1.1',         // Cloudflare Primary
-  '8.8.8.8',         // Google Primary
-  '208.67.222.222',  // OpenDNS Primary
-  '1.0.0.1',         // Cloudflare Secondary
-  '8.8.4.4'          // Google Secondary
+  { ip: '1.1.1.1', name: 'Cloudflare Primary' },
+  { ip: '1.0.0.1', name: 'Cloudflare Secondary' },
+  { ip: '8.8.8.8', name: 'Google Primary' },
+  { ip: '8.8.4.4', name: 'Google Secondary' },
+  { ip: '9.9.9.9', name: 'Quad9 Security' },
+  { ip: '149.112.112.112', name: 'Quad9 Assist' },
+  { ip: '208.67.222.222', name: 'OpenDNS Home' },
+  { ip: '208.67.220.220', name: 'OpenDNS Custom' },
+  { ip: '94.140.14.14', name: 'AdGuard Default' },
+  { ip: '76.76.2.0', name: 'ControlD Unfiltered' }
 ];
 
 // Stats Registry
@@ -18,21 +25,32 @@ const stats = {
   cacheMisses: 0,
   errors: 0,
   totalLatency: 0,
-  averageLatency: 0,
-  upstreamWins: {}
+  averageLatency: 0
 };
-UPSTREAMS.forEach(ip => stats.upstreamWins[ip] = 0);
 
-// In-Memory DNS Cache
-// Key format: name:type:class
+// Upstream Performance & Health Registry
+const upstreamStates = UPSTREAMS.map(dns => ({
+  ip: dns.ip,
+  name: dns.name,
+  pings: [],            // Last 5 ping latencies for sliding window
+  successCount: 0,
+  failCount: 0,
+  avgLatency: 120,      // Default initial latency estimate
+  lossRate: 0,
+  score: 120,           // Lower is better (latency + packet loss penalty)
+  routedQueries: 0,     // Total client queries won by this upstream
+  status: 'Healthy'     // 'Healthy', 'Warning', 'Offline'
+}));
+
+// In-Memory DNS Cache (Key: name:type:class)
 const cache = new Map();
 
-// Active Pending Upstream Queries
+// Active Pending Upstream Queries (UDP mapping)
 // key: myTxId -> { resolve, reject, timeout, originalTxId }
 const pendingQueries = new Map();
 let nextTxId = 1;
 
-// Initialize outgoing UDP socket for upstream racing
+// Initialize outgoing UDP socket for upstream routing & active health checks
 const udpSocket = dgram.createSocket('udp4');
 
 udpSocket.on('message', (msg, rinfo) => {
@@ -43,16 +61,10 @@ udpSocket.on('message', (msg, rinfo) => {
     if (pending) {
       clearTimeout(pending.timeout);
       pendingQueries.delete(txId);
-      
-      // Reward the winning upstream IP
-      if (stats.upstreamWins[rinfo.address] !== undefined) {
-        stats.upstreamWins[rinfo.address]++;
-      }
-      
       pending.resolve({ buffer: msg, from: rinfo.address });
     }
   } catch (err) {
-    console.error('Error parsing UDP response:', err);
+    console.error('Error handling UDP DNS response:', err);
   }
 });
 
@@ -60,7 +72,7 @@ udpSocket.on('error', (err) => {
   console.error('UDP socket error:', err);
 });
 
-// Helper to generate unique transaction IDs for upstream
+// Unique transaction ID generator
 function getNextTxId() {
   let id = nextTxId;
   while (pendingQueries.has(id)) {
@@ -70,13 +82,112 @@ function getNextTxId() {
   return id;
 }
 
-// Perform DNS racing across all upstreams
+// Active Health Check: Ping an upstream with a lightweight query
+function pingUpstream(ip) {
+  return new Promise((resolve) => {
+    const txId = getNextTxId();
+    
+    // Create standard SOA query for root zone as a small ping packet
+    const pingPacket = dnsPacket.encode({
+      type: 'query',
+      id: txId,
+      flags: dnsPacket.RECURSION_DESIRED,
+      questions: [{
+        type: 'SOA',
+        name: '.'
+      }]
+    });
+
+    const startTime = Date.now();
+    const timeout = setTimeout(() => {
+      pendingQueries.delete(txId);
+      resolve({ success: false, latency: 1000 });
+    }, 1500); // 1.5 seconds timeout
+
+    pendingQueries.set(txId, {
+      resolve: () => {
+        clearTimeout(timeout);
+        const latency = Date.now() - startTime;
+        resolve({ success: true, latency });
+      },
+      reject: () => {
+        clearTimeout(timeout);
+        resolve({ success: false, latency: 1000 });
+      },
+      timeout
+    });
+
+    udpSocket.send(pingPacket, 0, pingPacket.length, 53, ip, (err) => {
+      if (err) {
+        clearTimeout(timeout);
+        pendingQueries.delete(txId);
+        resolve({ success: false, latency: 1000 });
+      }
+    });
+  });
+}
+
+// Perform health checks on all upstreams in parallel
+async function performHealthChecks() {
+  await Promise.all(upstreamStates.map(async (state) => {
+    const res = await pingUpstream(state.ip);
+    
+    // Update sliding window (last 5 results)
+    if (res.success) {
+      state.pings.push(res.latency);
+      state.successCount++;
+    } else {
+      state.pings.push(1000); // Penalty latency for packet loss
+      state.failCount++;
+    }
+    if (state.pings.length > 5) {
+      state.pings.shift();
+    }
+
+    // Calculations
+    const validPings = state.pings.filter(p => p !== 1000);
+    state.avgLatency = validPings.length > 0 
+      ? Math.round(validPings.reduce((a, b) => a + b, 0) / validPings.length)
+      : 1000;
+
+    const lostCount = state.pings.filter(p => p === 1000).length;
+    state.lossRate = Math.round((lostCount / state.pings.length) * 100);
+
+    // Score = avgLatency + packet loss penalty
+    // Every 20% packet loss adds 100ms penalty
+    state.score = state.avgLatency + (state.lossRate * 5);
+
+    // Determine status
+    if (state.lossRate >= 60) {
+      state.status = 'Offline';
+    } else if (state.lossRate >= 20 || state.avgLatency > 250) {
+      state.status = 'Warning';
+    } else {
+      state.status = 'Healthy';
+    }
+  }));
+}
+
+// Perform initial check and schedule every 25 seconds
+performHealthChecks();
+setInterval(performHealthChecks, 25000);
+
+// Perform DNS racing on top 2 healthiest servers
 function raceDNS(queryBuffer, timeoutMs = 3000) {
   return new Promise((resolve, reject) => {
+    // Sort states by score ascending (lowest score is best)
+    const sortedActive = upstreamStates
+      .filter(s => s.status !== 'Offline')
+      .sort((a, b) => a.score - b.score);
+
+    // Get candidates: top 2 healthiest, or default fallback to top 2 if all offline
+    const candidates = sortedActive.length >= 2 
+      ? sortedActive.slice(0, 2) 
+      : (sortedActive.length > 0 ? sortedActive : upstreamStates.slice(0, 2));
+
     const originalTxId = queryBuffer.readUInt16BE(0);
     const myTxId = getNextTxId();
 
-    // Prepare packet for upstream (replace transaction ID)
     const upstreamQuery = Buffer.from(queryBuffer);
     upstreamQuery.writeUInt16BE(myTxId, 0);
 
@@ -87,7 +198,6 @@ function raceDNS(queryBuffer, timeoutMs = 3000) {
 
     pendingQueries.set(myTxId, {
       resolve: ({ buffer, from }) => {
-        // Restore client's original transaction ID
         const responseBuffer = Buffer.from(buffer);
         responseBuffer.writeUInt16BE(originalTxId, 0);
         resolve({ responseBuffer, from });
@@ -96,15 +206,14 @@ function raceDNS(queryBuffer, timeoutMs = 3000) {
       timeout
     });
 
-    // Send UDP packets to all upstreams concurrently
-    for (const ip of UPSTREAMS) {
-      udpSocket.send(upstreamQuery, 0, upstreamQuery.length, 53, ip, (err) => {
+    // Send UDP queries in parallel to the selected fast candidates
+    candidates.forEach(state => {
+      udpSocket.send(upstreamQuery, 0, upstreamQuery.length, 53, state.ip, (err) => {
         if (err) {
-          // Non-blocking log
-          // console.warn(`Failed to send DNS to upstream ${ip}:`, err.message);
+          // Log or ignore specific send failures
         }
       });
-    }
+    });
   });
 }
 
@@ -116,7 +225,7 @@ function getCacheKey(dnsPacketObj) {
 }
 
 function getMinTTL(dnsPacketObj) {
-  let minTtl = 300; // 5 minutes default
+  let minTtl = 300;
   let found = false;
 
   const processRecord = (rec) => {
@@ -132,9 +241,8 @@ function getMinTTL(dnsPacketObj) {
   if (dnsPacketObj.authorities) dnsPacketObj.authorities.forEach(processRecord);
   if (dnsPacketObj.additionals) dnsPacketObj.additionals.forEach(processRecord);
 
-  // Constraints
-  if (minTtl <= 0) minTtl = 5;       // Cache for at least 5s to avoid spamming
-  if (minTtl > 86400) minTtl = 86400; // Cap at 24 hours
+  if (minTtl <= 0) minTtl = 5;
+  if (minTtl > 86400) minTtl = 86400;
   return minTtl;
 }
 
@@ -186,7 +294,6 @@ async function handleDoH(queryBuffer) {
     const cachedEntry = cache.get(cacheKey);
     if (cachedEntry && Date.now() < cachedEntry.expiresAt) {
       stats.cacheHits++;
-      // Write the incoming transaction ID back into the cached buffer
       const clientTxId = queryBuffer.readUInt16BE(0);
       const responseBuffer = Buffer.from(cachedEntry.buffer);
       responseBuffer.writeUInt16BE(clientTxId, 0);
@@ -202,12 +309,18 @@ async function handleDoH(queryBuffer) {
   // 2. Cache Miss: Run Upstream Race
   stats.cacheMisses++;
   try {
-    const { responseBuffer } = await raceDNS(queryBuffer);
+    const { responseBuffer, from } = await raceDNS(queryBuffer);
     const latency = Date.now() - startTime;
     stats.totalLatency += latency;
     stats.averageLatency = stats.totalLatency / stats.totalQueries;
 
-    // Cache the successful response
+    // Track which upstream server won the race
+    const winner = upstreamStates.find(s => s.ip === from);
+    if (winner) {
+      winner.routedQueries++;
+    }
+
+    // Cache successful response
     if (cacheKey) {
       try {
         const dnsRespObj = dnsPacket.decode(responseBuffer);
@@ -217,14 +330,13 @@ async function handleDoH(queryBuffer) {
           expiresAt: Date.now() + ttl * 1000
         });
       } catch (e) {
-        // Cache decoding failure - non fatal
+        // Non-fatal cache failure
       }
     }
 
     return responseBuffer;
   } catch (err) {
     stats.errors++;
-    // Generate ServFail DNS response if racing fails
     try {
       const decodedQuery = dnsPacket.decode(queryBuffer);
       const servFailPacket = dnsPacket.encode({
@@ -240,9 +352,8 @@ async function handleDoH(queryBuffer) {
   }
 }
 
-// HTTP Server Setup
+// HTTP Server
 const server = http.createServer(async (req, res) => {
-  // CORS Headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -255,7 +366,7 @@ const server = http.createServer(async (req, res) => {
 
   const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
-  // Endpoint 1: DoH dns-query handler
+  // Endpoint 1: DoH Handler
   if (parsedUrl.pathname === '/dns-query') {
     if (req.method === 'GET') {
       const dnsParam = parsedUrl.searchParams.get('dns');
@@ -264,7 +375,6 @@ const server = http.createServer(async (req, res) => {
         res.end('Missing dns parameter');
         return;
       }
-
       try {
         const queryBuffer = base64urlDecode(dnsParam);
         const responseBuffer = await handleDoH(queryBuffer);
@@ -288,7 +398,6 @@ const server = http.createServer(async (req, res) => {
           res.end('Empty query body');
           return;
         }
-
         try {
           const responseBuffer = await handleDoH(queryBuffer);
           res.writeHead(200, {
@@ -309,18 +418,19 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Endpoint 2: JSON API Stats
+  // Endpoint 2: JSON API Stats (Includes detailed load balance data)
   if (parsedUrl.pathname === '/api/stats') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ...stats,
+      upstreams: upstreamStates,
       cacheSize: cache.size,
       uptime: process.uptime()
     }));
     return;
   }
 
-  // Endpoint 3: iOS Mobileconfig Generator
+  // Endpoint 3: iOS Profile Downloader
   if (parsedUrl.pathname === '/download-profile') {
     const host = req.headers.host || 'localhost';
     const uuid1 = generateUUID();
@@ -376,7 +486,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Endpoint 4: Premium Dashboard UI
+  // Endpoint 4: Premium Web Dashboard UI
   if (parsedUrl.pathname === '/') {
     const host = req.headers.host || 'localhost';
     const html = `<!DOCTYPE html>
@@ -384,17 +494,21 @@ const server = http.createServer(async (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Antigravity DNS Accelerator</title>
+    <title>Antigravity DNS Accelerator & Load Balancer</title>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-color: #080b11;
-            --panel-bg: rgba(17, 25, 40, 0.65);
-            --border-color: rgba(255, 255, 255, 0.08);
-            --accent-glow: linear-gradient(135deg, #00f2fe 0%, #4facfe 100%);
-            --accent-solid: #00f2fe;
+            --bg-color: #060913;
+            --panel-bg: rgba(13, 20, 38, 0.65);
+            --border-color: rgba(255, 255, 255, 0.06);
+            --accent-glow: linear-gradient(135deg, #00f7ff 0%, #0088ff 100%);
+            --accent-solid: #00f7ff;
             --text-color: #f3f4f6;
             --text-muted: #9ca3af;
+            
+            --color-healthy: #00ffaa;
+            --color-warning: #ffb800;
+            --color-offline: #ff3b30;
         }
 
         * {
@@ -410,28 +524,28 @@ const server = http.createServer(async (req, res) => {
             min-height: 100vh;
             overflow-x: hidden;
             background-image: 
-                radial-gradient(circle at 10% 20%, rgba(0, 242, 254, 0.05) 0%, transparent 40%),
-                radial-gradient(circle at 90% 80%, rgba(79, 172, 254, 0.05) 0%, transparent 40%);
+                radial-gradient(circle at 5% 15%, rgba(0, 247, 255, 0.05) 0%, transparent 35%),
+                radial-gradient(circle at 95% 85%, rgba(0, 136, 255, 0.05) 0%, transparent 35%);
         }
 
         .container {
-            max-width: 1100px;
+            max-width: 1200px;
             margin: 0 auto;
             padding: 40px 20px;
         }
 
         header {
             text-align: center;
-            margin-bottom: 50px;
+            margin-bottom: 45px;
         }
 
         header h1 {
             font-size: 2.8rem;
             font-weight: 800;
-            background: linear-gradient(to right, #00f2fe, #4facfe);
+            background: linear-gradient(to right, #00f7ff, #0088ff);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
-            margin-bottom: 10px;
+            margin-bottom: 8px;
             letter-spacing: -0.5px;
         }
 
@@ -443,26 +557,26 @@ const server = http.createServer(async (req, res) => {
 
         .grid-stats {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
             gap: 20px;
-            margin-bottom: 40px;
+            margin-bottom: 35px;
         }
 
         .stat-card {
             background: var(--panel-bg);
             border: 1px solid var(--border-color);
-            backdrop-filter: blur(16px);
+            backdrop-filter: blur(20px);
             border-radius: 20px;
-            padding: 25px;
+            padding: 24px;
             position: relative;
             overflow: hidden;
             transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
         }
 
         .stat-card:hover {
-            transform: translateY(-5px);
-            border-color: rgba(0, 242, 254, 0.25);
-            box-shadow: 0 10px 30px rgba(0, 242, 254, 0.05);
+            transform: translateY(-4px);
+            border-color: rgba(0, 247, 255, 0.2);
+            box-shadow: 0 12px 35px rgba(0, 247, 255, 0.04);
         }
 
         .stat-card::before {
@@ -480,10 +594,10 @@ const server = http.createServer(async (req, res) => {
 
         .stat-title {
             color: var(--text-muted);
-            font-size: 0.9rem;
+            font-size: 0.85rem;
             text-transform: uppercase;
             letter-spacing: 1px;
-            margin-bottom: 10px;
+            margin-bottom: 8px;
         }
 
         .stat-value {
@@ -493,24 +607,24 @@ const server = http.createServer(async (req, res) => {
         }
 
         .stat-unit {
-            font-size: 0.9rem;
+            font-size: 0.85rem;
             color: var(--text-muted);
             font-weight: 400;
-            margin-left: 4px;
+            margin-left: 3px;
         }
 
         .main-panel {
             background: var(--panel-bg);
             border: 1px solid var(--border-color);
-            backdrop-filter: blur(16px);
+            backdrop-filter: blur(20px);
             border-radius: 24px;
-            padding: 40px;
-            margin-bottom: 40px;
+            padding: 35px;
+            margin-bottom: 35px;
         }
 
         .main-panel h2 {
-            font-size: 1.6rem;
-            margin-bottom: 25px;
+            font-size: 1.5rem;
+            margin-bottom: 20px;
             font-weight: 600;
             display: flex;
             align-items: center;
@@ -520,31 +634,31 @@ const server = http.createServer(async (req, res) => {
         .main-panel h2::before {
             content: '';
             display: inline-block;
-            width: 8px; height: 24px;
+            width: 6px; height: 22px;
             background: var(--accent-glow);
-            border-radius: 4px;
+            border-radius: 3px;
         }
 
         .url-box {
-            background: rgba(0, 0, 0, 0.3);
+            background: rgba(0, 0, 0, 0.35);
             border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 15px 20px;
+            border-radius: 14px;
+            padding: 16px 20px;
             display: flex;
             justify-content: space-between;
             align-items: center;
             font-family: monospace;
-            font-size: 1rem;
+            font-size: 0.95rem;
             color: var(--accent-solid);
             margin-bottom: 30px;
         }
 
         .btn-copy {
-            background: rgba(255, 255, 255, 0.05);
+            background: rgba(255, 255, 255, 0.04);
             border: 1px solid var(--border-color);
             color: var(--text-color);
-            padding: 6px 12px;
-            border-radius: 6px;
+            padding: 7px 14px;
+            border-radius: 8px;
             cursor: pointer;
             transition: all 0.2s;
             font-size: 0.85rem;
@@ -557,38 +671,32 @@ const server = http.createServer(async (req, res) => {
             font-weight: 600;
         }
 
-        .setup-steps {
-            display: flex;
-            flex-direction: column;
-            gap: 15px;
-        }
-
         .device-accordion {
             border: 1px solid var(--border-color);
-            border-radius: 12px;
+            border-radius: 14px;
             overflow: hidden;
-            transition: background 0.3s;
+            margin-bottom: 12px;
+            background: rgba(255, 255, 255, 0.01);
+            transition: all 0.3s;
         }
 
         .device-header {
-            padding: 18px 25px;
-            background: rgba(255, 255, 255, 0.02);
+            padding: 16px 22px;
             cursor: pointer;
             display: flex;
             justify-content: space-between;
             align-items: center;
             font-weight: 600;
             user-select: none;
-            transition: background 0.2s;
         }
 
         .device-header:hover {
-            background: rgba(255, 255, 255, 0.04);
+            background: rgba(255, 255, 255, 0.03);
         }
 
         .device-content {
-            padding: 25px;
-            background: rgba(0, 0, 0, 0.15);
+            padding: 22px;
+            background: rgba(0, 0, 0, 0.18);
             border-top: 1px solid var(--border-color);
             display: none;
             line-height: 1.6;
@@ -599,7 +707,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         .device-content li {
-            margin-bottom: 10px;
+            margin-bottom: 8px;
         }
 
         .device-accordion.active .device-content {
@@ -624,59 +732,132 @@ const server = http.createServer(async (req, res) => {
             background: var(--accent-glow);
             color: #000;
             text-decoration: none;
-            padding: 10px 20px;
+            padding: 9px 18px;
             border-radius: 8px;
             font-weight: 600;
-            margin-top: 15px;
-            transition: transform 0.2s, box-shadow 0.2s;
+            margin-top: 12px;
+            transition: all 0.2s;
         }
 
         .btn-download:hover {
             transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(0, 242, 254, 0.3);
+            box-shadow: 0 5px 15px rgba(0, 247, 255, 0.25);
         }
 
-        .upstream-chart {
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-            margin-top: 20px;
+        /* Leaderboard / Table Style */
+        .table-container {
+            width: 100%;
+            overflow-x: auto;
         }
 
-        .upstream-bar-wrapper {
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+            font-size: 0.95rem;
+        }
+
+        th {
+            padding: 12px 16px;
+            border-bottom: 2px solid var(--border-color);
+            color: var(--text-muted);
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.8rem;
+            letter-spacing: 0.5px;
+        }
+
+        td {
+            padding: 16px;
+            border-bottom: 1px solid var(--border-color);
+            vertical-align: middle;
+        }
+
+        tr:hover td {
+            background: rgba(255, 255, 255, 0.01);
+        }
+
+        .dns-rank-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-align: center;
+        }
+
+        .rank-primary {
+            background: rgba(0, 247, 255, 0.15);
+            color: var(--accent-solid);
+            border: 1px solid rgba(0, 247, 255, 0.3);
+        }
+
+        .rank-secondary {
+            background: rgba(0, 136, 255, 0.15);
+            color: #55b2ff;
+            border: 1px solid rgba(0, 136, 255, 0.3);
+        }
+
+        .rank-backup {
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--text-muted);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .rank-offline {
+            background: rgba(255, 59, 48, 0.15);
+            color: var(--color-offline);
+            border: 1px solid rgba(255, 59, 48, 0.3);
+        }
+
+        .status-indicator {
             display: flex;
             align-items: center;
-            gap: 15px;
+            gap: 8px;
+            font-weight: 500;
         }
 
-        .upstream-name {
-            width: 140px;
-            font-size: 0.95rem;
-            color: var(--text-muted);
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            box-shadow: 0 0 8px currentColor;
         }
 
-        .upstream-progress-bg {
-            flex-grow: 1;
-            height: 10px;
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 5px;
+        .status-Healthy { color: var(--color-healthy); }
+        .status-Warning { color: var(--color-warning); }
+        .status-Offline { color: var(--color-offline); }
+
+        .progress-bar-container {
+            width: 100%;
+            max-width: 200px;
+            height: 8px;
+            background: rgba(255, 255, 255, 0.04);
+            border-radius: 4px;
             overflow: hidden;
+            display: inline-block;
+            vertical-align: middle;
+            margin-right: 10px;
         }
 
-        .upstream-progress-bar {
+        .progress-bar-fill {
             height: 100%;
             background: var(--accent-glow);
-            width: 0%;
-            border-radius: 5px;
-            transition: width 1s ease-in-out;
+            border-radius: 4px;
+            transition: width 0.5s ease;
         }
 
-        .upstream-count {
-            width: 60px;
-            text-align: right;
+        .latency-badge {
             font-variant-numeric: tabular-nums;
             font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
         }
+
+        .latency-Healthy { color: var(--color-healthy); }
+        .latency-Warning { color: var(--color-warning); }
+        .latency-Offline { color: var(--color-offline); }
 
         footer {
             text-align: center;
@@ -690,8 +871,8 @@ const server = http.createServer(async (req, res) => {
 <body>
     <div class="container">
         <header>
-            <h1>Antigravity DNS Accelerator</h1>
-            <p>Máy chủ phân luồng & tăng tốc internet cá nhân chạy trên Render</p>
+            <h1>Antigravity DNS Accelerator & Load Balancer</h1>
+            <p>Hệ thống tự động giám sát ping, cân bằng tải & tăng tốc độ internet</p>
         </header>
 
         <div class="grid-stats">
@@ -714,7 +895,29 @@ const server = http.createServer(async (req, res) => {
         </div>
 
         <div class="main-panel">
-            <h2>Đường dẫn DNS over HTTPS (DoH) của bạn</h2>
+            <h2>Bảng giám sát cân bằng tải & hiệu năng Upstream DNS</h2>
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Thứ hạng</th>
+                            <th>DNS Server</th>
+                            <th>Địa chỉ IP</th>
+                            <th>Độ trễ (Ping)</th>
+                            <th>Mất gói (%)</th>
+                            <th>Trạng thái</th>
+                            <th>Phân chia tải</th>
+                        </tr>
+                    </thead>
+                    <tbody id="dns-table-body">
+                        <!-- Rendered dynamically -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="main-panel">
+            <h2>Đường dẫn DNS over HTTPS (DoH) cá nhân</h2>
             <div class="url-box">
                 <span id="doh-url">https://${host}/dns-query</span>
                 <button class="btn-copy" onclick="copyUrl()">Sao chép</button>
@@ -722,96 +925,57 @@ const server = http.createServer(async (req, res) => {
 
             <h2>Cấu hình thiết bị</h2>
             <div class="setup-steps">
-                <!-- iOS / macOS -->
                 <div class="device-accordion">
                     <div class="device-header" onclick="toggleAccordion(this)">
-                        <span>Apple iOS / macOS (Tự động thiết lập hệ thống)</span>
+                        <span>Apple iOS / macOS (Tự động tải profile cấu hình)</span>
                         <span class="arrow"></span>
                     </div>
                     <div class="device-content">
-                        <p>iOS và macOS hỗ trợ cấu hình DNS mã hóa toàn hệ thống bằng DNS Profiles (.mobileconfig). Bấm vào nút bên dưới để tải profile cấu hình riêng của bạn.</p>
-                        <a href="/download-profile" class="btn-download">Tải Profile Cấu Hình (.mobileconfig)</a>
-                        <p style="margin-top: 15px; font-size: 0.9rem; color: var(--text-muted);">* Lưu ý: Sau khi tải về, hãy vào <strong>Cài đặt</strong> -> <strong>Đã tải về hồ sơ</strong> để kích hoạt và cài đặt profile.</p>
+                        <p>iOS và macOS hỗ trợ cấu hình DoH hệ thống bằng cấu hình di động. Nhấn nút bên dưới để tải tệp cài đặt và làm theo hướng dẫn.</p>
+                        <a href="/download-profile" class="btn-download">Tải Profile DoH (.mobileconfig)</a>
+                        <p style="margin-top: 15px; font-size: 0.9rem; color: var(--text-muted);">* Đi tới <strong>Cài đặt</strong> -> <strong>Hồ sơ đã tải về</strong> để kích hoạt sau khi hoàn tất tải.</p>
                     </div>
                 </div>
 
-                <!-- Android -->
                 <div class="device-accordion">
                     <div class="device-header" onclick="toggleAccordion(this)">
-                        <span>Google Android (Điện thoại / Máy tính bảng)</span>
+                        <span>Google Android (Sử dụng Nebulo hoặc Intra)</span>
                         <span class="arrow"></span>
                     </div>
                     <div class="device-content">
-                        <p>Hệ điều hành Android hỗ trợ Private DNS (DNS-over-TLS). Do Render chỉ hỗ trợ cổng HTTPS (DoH), bạn cần dùng một app trung gian như <strong>Nebulo</strong> hoặc <strong>Intra</strong> để kết nối:</p>
+                        <p>Do Render chạy trên cổng 443 HTTPS, Android yêu cầu app hỗ trợ DoH để dịch gói tin toàn hệ thống:</p>
                         <ol style="margin-top: 10px;">
-                            <li>Tải và cài đặt ứng dụng <strong>Intra</strong> hoặc <strong>Nebulo</strong> từ Google Play Store.</li>
-                            <li>Mở cài đặt của ứng dụng, chọn mục cấu hình DNS tùy chỉnh (Custom DoH Server).</li>
-                            <li>Nhập đường dẫn DoH của bạn ở trên vào.</li>
-                            <li>Bấm kích hoạt để chạy VPN DNS cục bộ nhằm tăng tốc tất cả ứng dụng.</li>
+                            <li>Tải app <strong>Intra</strong> hoặc <strong>Nebulo</strong> miễn phí trên Play Store.</li>
+                            <li>Vào phần thiết lập DNS cá nhân (Custom Server URL).</li>
+                            <li>Dán URL DoH bên trên của bạn vào và nhấn Lưu.</li>
+                            <li>Bật ứng dụng lên để phân luồng tốc độ cao.</li>
                         </ol>
                     </div>
                 </div>
 
-                <!-- Browsers -->
                 <div class="device-accordion">
                     <div class="device-header" onclick="toggleAccordion(this)">
                         <span>Trình duyệt (Chrome / Firefox / Edge / Brave)</span>
                         <span class="arrow"></span>
                     </div>
                     <div class="device-content">
-                        <p>Để tăng tốc độ lướt web trên máy tính, bạn có thể chỉ cấu hình DNS an toàn trực tiếp trên trình duyệt lướt web:</p>
-                        <h4 style="margin-top: 10px; font-size: 1rem;">Google Chrome / Brave / Edge:</h4>
-                        <ol>
-                            <li>Vào <strong>Cài đặt (Settings)</strong> -> <strong>Quyền riêng tư và bảo mật (Privacy & Security)</strong> -> <strong>Bảo mật (Security)</strong>.</li>
-                            <li>Tìm mục <strong>Sử dụng DNS an toàn (Use Secure DNS)</strong>.</li>
-                            <li>Chọn <strong>Với: Tùy chỉnh (With: Custom)</strong> và nhập đường dẫn DoH ở trên vào.</li>
-                        </ol>
-                        <h4 style="margin-top: 15px; font-size: 1rem;">Mozilla Firefox:</h4>
-                        <ol>
-                            <li>Vào <strong>Cài đặt (Settings)</strong> -> <strong>Quyền riêng tư & Bảo mật (Privacy & Security)</strong>.</li>
-                            <li>Kéo xuống cuối tìm mục <strong>DNS qua HTTPS (DNS over HTTPS)</strong>.</li>
-                            <li>Chọn chế độ <strong>Bảo vệ tối đa (Max Protection)</strong>, chọn nhà cung cấp: <strong>Tùy chỉnh (Custom)</strong> và điền đường dẫn DoH ở trên vào.</li>
-                        </ol>
+                        <h4 style="font-size: 1rem;">Chrome / Edge / Brave:</h4>
+                        <p>Vào Cài đặt -> Quyền riêng tư và bảo mật -> Bảo mật -> Chọn Sử dụng DNS an toàn -> Nhập thủ công dán link DoH của bạn vào.</p>
+                        <h4 style="margin-top: 15px; font-size: 1rem;">Firefox:</h4>
+                        <p>Settings -> Privacy & Security -> DNS over HTTPS -> chọn Max Protection -> Custom Provider -> điền link DoH của bạn.</p>
                     </div>
                 </div>
-
-                <!-- Windows 11 -->
-                <div class="device-accordion">
-                    <div class="device-header" onclick="toggleAccordion(this)">
-                        <span>Microsoft Windows 11</span>
-                        <span class="arrow"></span>
-                    </div>
-                    <div class="device-content">
-                        <p>Windows 11 hỗ trợ cấu hình DoH hệ thống nhưng yêu cầu bổ sung cấu hình IP để kích hoạt mẫu:</p>
-                        <ol>
-                            <li>Vào <strong>Settings (Cài đặt)</strong> -> <strong>Network & internet (Mạng & internet)</strong> -> <strong>Wi-Fi</strong> hoặc <strong>Ethernet</strong>.</li>
-                            <li>Tìm mục <strong>DNS server assignment</strong>, bấm <strong>Edit</strong>.</li>
-                            <li>Chuyển sang <strong>Manual</strong>, bật <strong>IPv4</strong>.</li>
-                            <li>Ở phần <strong>Preferred DNS</strong>, nhập IP một upstream đại diện (ví dụ: <code>1.1.1.1</code>).</li>
-                            <li>Ở phần <strong>Preferred DNS encryption</strong>, chọn <strong>Encrypted only (DNS over HTTPS)</strong>.</li>
-                            <li>Tìm mục mẫu liên kết DoH và điền đường dẫn DoH ở trên vào nếu có, hoặc Windows sẽ tự nhận dạng.</li>
-                        </ol>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <div class="main-panel">
-            <h2>Thống kê tốc độ Upstream DNS Racing</h2>
-            <div class="upstream-chart" id="upstream-chart">
-                <!-- Rendered dynamically -->
             </div>
         </div>
 
         <footer>
-            <p>Được phát triển bởi Antigravity Coding Engine v3. Trạng thái server: Hoạt động ổn định.</p>
+            <p>Phát triển bởi Antigravity Coding Engine v3. Tự động kiểm tra sức khỏe DNS định kỳ.</p>
         </footer>
     </div>
 
     <script>
         function toggleAccordion(el) {
-            const acc = el.parentElement;
-            acc.classList.toggle('active');
+            el.parentElement.classList.toggle('active');
         }
 
         function copyUrl() {
@@ -819,7 +983,7 @@ const server = http.createServer(async (req, res) => {
             navigator.clipboard.writeText(urlText).then(() => {
                 const btn = document.querySelector('.btn-copy');
                 btn.innerText = 'Đã chép!';
-                btn.style.background = '#00f2fe';
+                btn.style.background = '#00f7ff';
                 btn.style.color = '#000';
                 setTimeout(() => {
                     btn.innerText = 'Sao chép';
@@ -834,54 +998,80 @@ const server = http.createServer(async (req, res) => {
                 const res = await fetch('/api/stats');
                 const data = await res.json();
                 
-                // Cập nhật số liệu
+                // Update Cards
                 document.getElementById('total-queries').innerText = data.totalQueries.toLocaleString();
-                
                 const hitRate = data.totalQueries > 0 ? Math.round((data.cacheHits / data.totalQueries) * 100) : 0;
                 document.getElementById('cache-hit-rate').innerHTML = hitRate + '<span class="stat-unit">%</span>';
-                
-                const avgLat = Math.round(data.averageLatency);
-                document.getElementById('avg-latency').innerHTML = avgLat + '<span class="stat-unit">ms</span>';
-                
+                document.getElementById('avg-latency').innerHTML = Math.round(data.averageLatency) + '<span class="stat-unit">ms</span>';
                 document.getElementById('cache-size').innerHTML = data.cacheSize + '<span class="stat-unit">records</span>';
 
-                // Vẽ bảng Upstream Racing
-                const chartContainer = document.getElementById('upstream-chart');
-                chartContainer.innerHTML = '';
-                
-                const wins = data.upstreamWins;
-                const totalWins = Object.values(wins).reduce((a, b) => a + b, 0);
+                // Render Load Balancer Table
+                const tableBody = document.getElementById('dns-table-body');
+                tableBody.innerHTML = '';
 
-                // Sắp xếp các upstream theo số lượt thắng
-                const sortedUpstreams = Object.entries(wins).sort((a, b) => b[1] - a[1]);
+                // Calculate total queries routed to upstreams to calculate percentages
+                const upstreams = data.upstreams || [];
+                const totalRouted = upstreams.reduce((acc, curr) => acc + curr.routedQueries, 0);
 
-                sortedUpstreams.forEach(([ip, count]) => {
-                    const percent = totalWins > 0 ? Math.round((count / totalWins) * 100) : 0;
+                // Sort upstreams based on score (to match routing preference order)
+                const sortedUpstreams = [...upstreams].sort((a, b) => {
+                    if (a.status === 'Offline') return 1;
+                    if (b.status === 'Offline') return -1;
+                    return a.score - b.score;
+                });
+
+                sortedUpstreams.forEach((dns, index) => {
+                    let rankText = 'Mặc định';
+                    let rankClass = 'rank-backup';
                     
-                    const wrapper = document.createElement('div');
-                    wrapper.className = 'upstream-bar-wrapper';
-                    
-                    let displayName = ip;
-                    if (ip === '1.1.1.1' || ip === '1.0.0.1') displayName = 'Cloudflare (' + ip + ')';
-                    else if (ip === '8.8.8.8' || ip === '8.8.4.4') displayName = 'Google (' + ip + ')';
-                    else if (ip === '208.67.222.222' || ip === '208.67.220.220') displayName = 'OpenDNS (' + ip + ')';
+                    if (dns.status === 'Offline') {
+                        rankText = 'Mất kết nối';
+                        rankClass = 'rank-offline';
+                    } else if (index === 0) {
+                        rankText = '#1 Primary';
+                        rankClass = 'rank-primary';
+                    } else if (index === 1) {
+                        rankText = '#2 Secondary';
+                        rankClass = 'rank-secondary';
+                    } else {
+                        rankText = 'Backup';
+                    }
 
-                    wrapper.innerHTML = \`
-                        <div class="upstream-name">\${displayName}</div>
-                        <div class="upstream-progress-bg">
-                            <div class="upstream-progress-bar" style="width: \${percent}%"></div>
-                        </div>
-                        <div class="upstream-count">\${count} lượt</div>
-                    \`;
-                    chartContainer.appendChild(wrapper);
+                    const routedPercent = totalRouted > 0 ? Math.round((dns.routedQueries / totalRouted) * 100) : 0;
+                    
+                    const row = document.createElement('tr');
+                    
+                    // Latency class
+                    let latClass = 'latency-Healthy';
+                    if (dns.avgLatency > 250) latClass = 'latency-Offline';
+                    else if (dns.avgLatency > 120) latClass = 'latency-Warning';
+
+                    row.innerHTML = '<td><span class="dns-rank-badge ' + rankClass + '">' + rankText + '</span></td>' +
+                        '<td><strong>' + dns.name + '</strong></td>' +
+                        '<td style="font-family: monospace;">' + dns.ip + '</td>' +
+                        '<td><span class="latency-badge ' + latClass + '">' + (dns.status === 'Offline' ? '--' : dns.avgLatency + ' ms') + '</span></td>' +
+                        '<td style="font-family: tabular-nums;">' + dns.lossRate + '%</td>' +
+                        '<td>' +
+                            '<span class="status-indicator status-' + dns.status + '">' +
+                                '<span class="status-dot" style="background-color: currentColor;"></span>' +
+                                dns.status +
+                            '</span>' +
+                        '</td>' +
+                        '<td>' +
+                            '<div class="progress-bar-container">' +
+                                '<div class="progress-bar-fill" style="width: ' + routedPercent + '%"></div>' +
+                            '</div>' +
+                            '<span style="font-size: 0.85rem; font-weight: 600;">' + dns.routedQueries + ' (' + routedPercent + '%)</span>' +
+                        '</td>';
+                    tableBody.appendChild(row);
                 });
 
             } catch (err) {
-                console.error('Error fetching stats:', err);
+                console.error('Error loading stats:', err);
             }
         }
 
-        // Fetch stats immediately and then refresh every 3 seconds
+        // Run
         fetchStats();
         setInterval(fetchStats, 3000);
     </script>
@@ -893,9 +1083,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-// Start Server
 server.listen(PORT, () => {
-  console.log(`Antigravity DNS Accelerator running on http://localhost:${PORT}`);
-  console.log(`Accepting DoH requests at /dns-query`);
-  console.log(`Active upstream resolvers: ${UPSTREAMS.join(', ')}`);
+  console.log(`Antigravity DNS Accelerator & Load Balancer running on http://localhost:${PORT}`);
+  console.log(`DNS health-check active monitoring started.`);
 });
