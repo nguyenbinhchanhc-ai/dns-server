@@ -509,6 +509,16 @@ const server = http.createServer(async (req, res) => {
                 <string>HTTPS</string>
                 <key>ServerURL</key>
                 <string>https://${host}/dns-query</string>
+                <key>ServerAddresses</key>
+                <array>
+                    <string>1.1.1.1</string>
+                    <string>1.0.0.1</string>
+                    <string>8.8.8.8</string>
+                    <string>8.8.4.4</string>
+                    <string>9.9.9.9</string>
+                </array>
+                <key>ProhibitFallback</key>
+                <true/>
             </dict>
             <key>PayloadDescription</key>
             <string>Cấu hình DNS over HTTPS tăng tốc độ truy cập Internet thông qua Antigravity DoH Proxy.</string>
@@ -1005,6 +1015,11 @@ const server = http.createServer(async (req, res) => {
                     <div class="device-content">
                         <p>Nhấp vào nút bên dưới để tải và cài đặt profile hệ thống:</p>
                         <a href="/download-profile" class="btn-download">Tải Profile Cấu Hình (.mobileconfig)</a>
+                        <p style="margin-top: 15px; font-size: 0.9rem; color: var(--text-muted);">
+                            <strong>Tính năng bảo mật nâng cao:</strong><br>
+                            • <strong>Ép buộc điều tuyến (Prohibit Fallback)</strong>: Gom và buộc 100% truy vấn DNS đi qua máy chủ DoH, ngăn chặn việc rò rỉ (leak) ra DNS mặc định của Wi-Fi hay nhà mạng di động.<br>
+                            • <strong>Tối ưu chuyển mạng (Bootstrap DNS)</strong>: Khai báo sẵn các IP định danh (1.1.1.1, 8.8.8.8) giúp thiết bị iOS kết nối ngay lập tức và duy trì độ trễ cực thấp khi di chuyển giữa Wi-Fi và mạng di động 4G/5G.
+                        </p>
                     </div>
                 </div>
 
