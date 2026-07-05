@@ -1879,21 +1879,21 @@ const server = http.createServer(async (req, res) => {
                 let upstreamsStr = '';
                 for (let i = 0; i < stats.upstreams.length; i++) {
                     const dns = stats.upstreams[i];
-                    upstreamsStr += '- ' + dns.name + ' (' + dns.ip + '): Ping ' + dns.avgLatency + 'ms, Trễ thực EMA ' + dns.realAvgLatency + 'ms, Đã chia ' + dns.routedQueries + ' truy vấn, Trạng thái: ' + dns.status + '\n';
+                    upstreamsStr += '- ' + dns.name + ' (' + dns.ip + '): Ping ' + dns.avgLatency + 'ms, Trễ thực EMA ' + dns.realAvgLatency + 'ms, Đã chia ' + dns.routedQueries + ' truy vấn, Trạng thái: ' + dns.status + '\\n';
                 }
 
-                const prompt = 'Hãy đóng vai trò là Chuyên gia Tối ưu hóa Mạng. Phân tích các thông số hoạt động của máy chủ DNS sau đây để cung cấp một báo cáo sức khỏe ngắn gọn và gợi ý cấu hình tốt nhất bằng Tiếng Việt.\n\n' +
-                    'Thông số hệ thống:\n' +
-                    '- Tổng số truy vấn: ' + stats.totalQueries + '\n' +
-                    '- Tỷ lệ Cache Hit: ' + (stats.totalQueries > 0 ? Math.round((stats.cacheHits / stats.totalQueries) * 100) : 0) + '%\n' +
-                    '- Số lần SWR ngầm: ' + stats.swrHits + '\n' +
-                    '- Độ trễ trung bình: ' + Math.round(stats.averageLatency) + 'ms\n' +
-                    '- Kích thước cache hiện tại: ' + stats.cacheSize + ' bản ghi\n' +
-                    '- Uptime hoạt động: ' + Math.round(stats.uptime) + ' giây\n' +
-                    '- Trạng thái 10 Upstream DNS:\n' + upstreamsStr + '\n' +
-                    'Yêu cầu báo cáo gồm:\n' +
-                    '1. Đánh giá trạng thái tổng quan (Ví dụ: Tốt/Có nguy cơ/Chậm).\n' +
-                    '2. Phân tích các DNS Upstream nổi bật (nhà mạng nào nhanh, nhà mạng nào có lỗi).\n' +
+                const prompt = 'Hãy đóng vai trò là Chuyên gia Tối ưu hóa Mạng. Phân tích các thông số hoạt động của máy chủ DNS sau đây để cung cấp một báo cáo sức khỏe ngắn gọn và gợi ý cấu hình tốt nhất bằng Tiếng Việt.\\n\\n' +
+                    'Thông số hệ thống:\\n' +
+                    '- Tổng số truy vấn: ' + stats.totalQueries + '\\n' +
+                    '- Tỷ lệ Cache Hit: ' + (stats.totalQueries > 0 ? Math.round((stats.cacheHits / stats.totalQueries) * 100) : 0) + '%\\n' +
+                    '- Số lần SWR ngầm: ' + stats.swrHits + '\\n' +
+                    '- Độ trễ trung bình: ' + Math.round(stats.averageLatency) + 'ms\\n' +
+                    '- Kích thước cache hiện tại: ' + stats.cacheSize + ' bản ghi\\n' +
+                    '- Uptime hoạt động: ' + Math.round(stats.uptime) + ' giây\\n' +
+                    '- Trạng thái 10 Upstream DNS:\\n' + upstreamsStr + '\\n' +
+                    'Yêu cầu báo cáo gồm:\\n' +
+                    '1. Đánh giá trạng thái tổng quan (Ví dụ: Tốt/Có nguy cơ/Chậm).\\n' +
+                    '2. Phân tích các DNS Upstream nổi bật (nhà mạng nào nhanh, nhà mạng nào có lỗi).\\n' +
                     '3. Đề xuất hành động (ví dụ: cần làm gì trên thiết bị iOS/Android hoặc cài đặt lại vùng mạng).';
 
                 const reply = await queryGemini([{ role: 'user', content: prompt }]);
@@ -1912,7 +1912,7 @@ const server = http.createServer(async (req, res) => {
                 .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
                 .replace(/\*(.*?)\*/g, '<em>$1</em>')
                 .replace(new RegExp('\\\\x60([^\\\\x60]+)\\\\x60', 'g'), '<code style="background: rgba(255,255,255,0.1); padding: 2px 4px; border-radius: 4px;">$1</code>')
-                .replace(/\n/g, '<br>')
+                .replace(/\\n/g, '<br>')
                 .replace(/^- (.*)$/gm, '• $1');
         }
 
