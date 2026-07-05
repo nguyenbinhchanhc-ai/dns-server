@@ -885,6 +885,67 @@ const server = http.createServer(async (req, res) => {
             res.end('Thiếu apiEndpoint');
             return;
           }
+
+          const isOfficialGemini = (apiKey && apiKey.startsWith('AIzaSy')) || apiEndpoint.includes('generativelanguage.googleapis.com');
+          
+          if (isOfficialGemini) {
+            if (!apiKey) {
+              res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+              res.end('Thiếu API Key cho Google AI Studio');
+              return;
+            }
+            
+            const reqModel = model === 'gemini' ? 'gemini-1.5-flash' : (model || 'gemini-1.5-flash');
+            const targetUrl = `https://generativelanguage.googleapis.com/v1beta/models/${reqModel}:generateContent?key=${apiKey}`;
+            
+            const systemMessage = messages.find(m => m.role === 'system');
+            const systemInstruction = systemMessage ? { parts: [{ text: systemMessage.content }] } : undefined;
+            
+            const chatContents = messages
+              .filter(m => m.role !== 'system')
+              .map(m => ({
+                role: m.role === 'assistant' ? 'model' : 'user',
+                parts: [{ text: m.content }]
+              }));
+              
+            const response = await fetch(targetUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                contents: chatContents,
+                systemInstruction
+              })
+            });
+            
+            if (!response.ok) {
+              const errText = await response.text();
+              res.writeHead(response.status, { 'Content-Type': 'text/plain; charset=utf-8' });
+              res.end(`Lỗi kết nối Official Gemini API: ${errText}`);
+              return;
+            }
+            
+            const resJson = await response.json();
+            if (!resJson.candidates || resJson.candidates.length === 0 || !resJson.candidates[0].content) {
+              res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+              res.end('Phản hồi trống từ Google API. Hãy kiểm tra lại API Key hoặc tên model.');
+              return;
+            }
+            
+            const replyText = resJson.candidates[0].content.parts[0].text;
+            const mappedResponse = {
+              choices: [
+                {
+                  message: {
+                    role: 'assistant',
+                    content: replyText
+                  }
+                }
+              ]
+            };
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify(mappedResponse));
+            return;
+          }
           
           const cleanEndpoint = apiEndpoint.endsWith('/') ? apiEndpoint.slice(0, -1) : apiEndpoint;
           const targetUrl = `${cleanEndpoint}/chat/completions`;
