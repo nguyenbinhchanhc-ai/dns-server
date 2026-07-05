@@ -138,6 +138,19 @@ async function runTests() {
     
     console.log('=> TEST 4: PASS');
 
+    // --- CA KIỂM THỬ 5: Xác minh AI Chat Proxy Handler ---
+    console.log('\n[TEST 5]: Kiểm tra AI Chat Proxy Handler...');
+    
+    // Gửi một yêu cầu chat trống để kiểm tra endpoint phản ứng lỗi 400 khi thiếu apiEndpoint
+    const chatErrRes = await fetch(`${url}/api/ai-chat`, {
+      method: 'POST',
+      body: JSON.stringify({ messages: [] })
+    });
+    console.log(`=> Mã lỗi phản hồi (mong đợi 400): ${chatErrRes.status}`);
+    if (chatErrRes.status !== 400) throw new Error('Query AI Chat không trả về lỗi 400 khi thiếu cấu hình');
+    
+    console.log('=> TEST 5: PASS');
+
   } catch (err) {
     console.error('\n❌ PHÁT HIỆN LỖI KIỂM THỬ:', err.message);
     passed = false;

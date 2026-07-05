@@ -870,6 +870,63 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Endpoint 1.5: AI Chat Proxy Handler
+  if (parsedUrl.pathname === '/api/ai-chat') {
+    if (req.method === 'POST') {
+      let bodyChunks = [];
+      req.on('data', chunk => bodyChunks.push(chunk));
+      req.on('end', async () => {
+        try {
+          const body = JSON.parse(Buffer.concat(bodyChunks).toString());
+          const { apiEndpoint, apiKey, model, messages } = body;
+          
+          if (!apiEndpoint) {
+            res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('Thiếu apiEndpoint');
+            return;
+          }
+          
+          const cleanEndpoint = apiEndpoint.endsWith('/') ? apiEndpoint.slice(0, -1) : apiEndpoint;
+          const targetUrl = `${cleanEndpoint}/chat/completions`;
+          
+          const headers = {
+            'Content-Type': 'application/json'
+          };
+          if (apiKey) {
+            headers['Authorization'] = `Bearer ${apiKey}`;
+          }
+          
+          const response = await fetch(targetUrl, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              model: model || 'gemini',
+              messages
+            })
+          });
+          
+          if (!response.ok) {
+            const errText = await response.text();
+            res.writeHead(response.status, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end(`Lỗi kết nối Gemini API: ${errText}`);
+            return;
+          }
+          
+          const resJson = await response.json();
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify(resJson));
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end(err.message);
+        }
+      });
+    } else {
+      res.writeHead(405, { 'Content-Type': 'text/plain' });
+      res.end('Method Not Allowed');
+    }
+    return;
+  }
+
   // Endpoint 2: JSON API Stats (Includes detailed load balance & SWR data)
   if (parsedUrl.pathname === '/api/stats') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1447,6 +1504,48 @@ const server = http.createServer(async (req, res) => {
             </div>
         </div>
 
+        <div class="main-panel" style="border: 1px solid rgba(139, 92, 246, 0.25); background: rgba(15, 10, 30, 0.5); box-shadow: 0 0 15px rgba(139, 92, 246, 0.05); margin-top: 10px;">
+            <h2 style="color: #a78bfa; display: flex; align-items: center; gap: 10px;">
+                🧠 Trợ lý Phân tích & Trò chuyện Gemini AI
+            </h2>
+            <p style="font-size: 0.9rem; color: var(--text-muted); margin-bottom: 20px;">
+                Tích hợp bộ não AI từ dự án <a href="https://github.com/ntthanh2603/gemini-web-to-api" target="_blank" style="color: #c084fc; text-decoration: underline;">gemini-web-to-api</a> để phân tích sức khỏe mạng và trò chuyện hỗ trợ vận hành.
+            </p>
+            
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; background: rgba(0,0,0,0.25); padding: 15px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.05);">
+                <div>
+                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 5px; font-weight: 600;">Địa chỉ API Bộ não</label>
+                    <input type="text" id="ai-endpoint" value="http://localhost:4981/v1" style="width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border-color); background: rgba(0,0,0,0.4); color: #fff; font-size: 0.85rem;" placeholder="http://localhost:4981/v1">
+                </div>
+                <div>
+                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 5px; font-weight: 600;">API Key (Nếu có)</label>
+                    <input type="password" id="ai-key" style="width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border-color); background: rgba(0,0,0,0.4); color: #fff; font-size: 0.85rem;" placeholder="Bỏ trống nếu chạy Docker local">
+                </div>
+                <div>
+                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 5px; font-weight: 600;">Model sử dụng</label>
+                    <input type="text" id="ai-model" value="gemini" style="width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border-color); background: rgba(0,0,0,0.4); color: #fff; font-size: 0.85rem;" placeholder="gemini">
+                </div>
+            </div>
+
+            <div style="display: flex; gap: 15px; margin-bottom: 20px;">
+                <button class="btn-copy" onclick="analyzeNetwork()" style="background: rgba(139, 92, 246, 0.15); border-color: rgba(139, 92, 246, 0.3); color: #c084fc; font-weight: 600; padding: 10px 20px;">📊 AI Phân tích hiệu năng mạng</button>
+            </div>
+
+            <div id="ai-analysis-result" style="display: none; background: rgba(0,0,0,0.2); border: 1px solid rgba(139, 92, 246, 0.2); border-radius: 12px; padding: 20px; font-size: 0.9rem; line-height: 1.6; margin-bottom: 25px; max-height: 300px; overflow-y: auto; text-align: left;">
+                <!-- AI insights render here -->
+            </div>
+
+            <div style="border: 1px solid rgba(255,255,255,0.05); border-radius: 12px; overflow: hidden; background: rgba(0,0,0,0.2);">
+                <div id="ai-chat-history" style="height: 250px; overflow-y: auto; padding: 15px; display: flex; flex-direction: column; gap: 12px; font-size: 0.9rem; text-align: left;">
+                    <div style="color: var(--text-muted); text-align: center; margin-top: 80px;">Trò chuyện với trợ lý Gemini AI... Hỏi tôi bất cứ câu hỏi nào về hệ thống DNS này!</div>
+                </div>
+                <div style="display: flex; border-top: 1px solid rgba(255,255,255,0.05);">
+                    <input type="text" id="ai-chat-input" style="flex: 1; padding: 15px; background: rgba(0,0,0,0.3); border: none; color: #fff; font-size: 0.9rem;" placeholder="Hỏi Gemini..." onkeydown="if(event.key === 'Enter') sendAiChat()">
+                    <button onclick="sendAiChat()" style="padding: 0 25px; background: #8b5cf6; border: none; color: #fff; font-weight: 600; cursor: pointer; transition: background 0.2s;">Gửi</button>
+                </div>
+            </div>
+        </div>
+
         <div class="main-panel" style="border: 1px solid rgba(0, 247, 255, 0.2); background: rgba(0, 8, 16, 0.5); box-shadow: 0 0 15px rgba(0, 247, 255, 0.05); margin-top: 10px;">
             <h2 style="color: var(--accent-glow); display: flex; align-items: center; gap: 10px;">
                 <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background-color: var(--accent-solid); box-shadow: 0 0 8px var(--accent-solid); animation: pulse 1.5s infinite;"></span>
@@ -1606,6 +1705,154 @@ const server = http.createServer(async (req, res) => {
             } catch (err) {
                 console.error('Error loading stats:', err);
             }
+        }
+
+        // Save/Load API Configuration
+        window.addEventListener('DOMContentLoaded', () => {
+            const savedEndpoint = localStorage.getItem('ai_endpoint');
+            const savedKey = localStorage.getItem('ai_key');
+            const savedModel = localStorage.getItem('ai_model');
+
+            if (savedEndpoint) document.getElementById('ai-endpoint').value = savedEndpoint;
+            if (savedKey) document.getElementById('ai-key').value = savedKey;
+            if (savedModel) document.getElementById('ai-model').value = savedModel;
+        });
+
+        function saveConfig() {
+            const ep = document.getElementById('ai-endpoint').value;
+            const key = document.getElementById('ai-key').value;
+            const model = document.getElementById('ai-model').value;
+
+            localStorage.setItem('ai_endpoint', ep);
+            localStorage.setItem('ai_key', key);
+            localStorage.setItem('ai_model', model);
+            return { ep, key, model };
+        }
+
+        async function queryGemini(messages) {
+            const config = saveConfig();
+            
+            const response = await fetch('/api/ai-chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    apiEndpoint: config.ep,
+                    apiKey: config.key,
+                    model: config.model,
+                    messages: messages
+                })
+            });
+
+            if (!response.ok) {
+                const errText = await response.text();
+                throw new Error(errText);
+            }
+
+            const data = await response.json();
+            return data.choices[0].message.content;
+        }
+
+        let chatMessages = [];
+
+        async function sendAiChat() {
+            const input = document.getElementById('ai-chat-input');
+            const query = input.value.trim();
+            if (!query) return;
+
+            input.value = '';
+            
+            const chatHistory = document.getElementById('ai-chat-history');
+            if (chatMessages.length === 0) chatHistory.innerHTML = '';
+
+            // Render User message
+            const userDiv = document.createElement('div');
+            userDiv.style.alignSelf = 'flex-end';
+            userDiv.style.background = 'rgba(139, 92, 246, 0.2)';
+            userDiv.style.padding = '10px 15px';
+            userDiv.style.borderRadius = '12px 12px 0 12px';
+            userDiv.style.maxWidth = '80%';
+            userDiv.style.marginBottom = '8px';
+            userDiv.innerHTML = '<strong>Bạn:</strong><br>' + escapeHtml(query);
+            chatHistory.appendChild(userDiv);
+            chatHistory.scrollTop = chatHistory.scrollHeight;
+
+            chatMessages.push({ role: 'user', content: query });
+
+            // Render AI Loading
+            const aiDiv = document.createElement('div');
+            aiDiv.style.alignSelf = 'flex-start';
+            aiDiv.style.background = 'rgba(255, 255, 255, 0.05)';
+            aiDiv.style.padding = '10px 15px';
+            aiDiv.style.borderRadius = '12px 12px 12px 0';
+            aiDiv.style.maxWidth = '80%';
+            aiDiv.style.marginBottom = '8px';
+            aiDiv.innerHTML = '<strong>Gemini:</strong><br><span style="color: var(--text-muted);">Đang suy nghĩ...</span>';
+            chatHistory.appendChild(aiDiv);
+            chatHistory.scrollTop = chatHistory.scrollHeight;
+
+            try {
+                const systemPrompt = 'Bạn là Trợ lý AI đặc biệt được tích hợp trong Dashboard của Antigravity DNS Proxy, phát triển dựa trên dự án gemini-web-to-api. Bạn có nhiệm vụ giải đáp thắc mắc về hệ thống DNS, mạng di động, và hướng dẫn vận hành DNS Server này cho người dùng.';
+                const payload = [
+                    { role: 'system', content: systemPrompt },
+                    ...chatMessages
+                ];
+                const reply = await queryGemini(payload);
+                
+                aiDiv.innerHTML = '<strong>Gemini:</strong><br>' + formatMarkdown(reply);
+                chatMessages.push({ role: 'assistant', content: reply });
+            } catch (err) {
+                aiDiv.innerHTML = '<strong>Gemini:</strong><br><span style="color: #ff453a;">Lỗi kết nối bộ não AI: ' + escapeHtml(err.message) + '</span>';
+            }
+            chatHistory.scrollTop = chatHistory.scrollHeight;
+        }
+
+        async function analyzeNetwork() {
+            const resultBox = document.getElementById('ai-analysis-result');
+            resultBox.style.display = 'block';
+            resultBox.innerHTML = '<span style="color: var(--text-muted);">Đang tải dữ liệu mạng và phân tích với Gemini AI...</span>';
+
+            try {
+                const res = await fetch('/api/stats');
+                const stats = await res.json();
+                
+                let upstreamsStr = '';
+                for (let i = 0; i < stats.upstreams.length; i++) {
+                    const dns = stats.upstreams[i];
+                    upstreamsStr += '- ' + dns.name + ' (' + dns.ip + '): Ping ' + dns.avgLatency + 'ms, Trễ thực EMA ' + dns.realAvgLatency + 'ms, Đã chia ' + dns.routedQueries + ' truy vấn, Trạng thái: ' + dns.status + '\n';
+                }
+
+                const prompt = 'Hãy đóng vai trò là Chuyên gia Tối ưu hóa Mạng. Phân tích các thông số hoạt động của máy chủ DNS sau đây để cung cấp một báo cáo sức khỏe ngắn gọn và gợi ý cấu hình tốt nhất bằng Tiếng Việt.\n\n' +
+                    'Thông số hệ thống:\n' +
+                    '- Tổng số truy vấn: ' + stats.totalQueries + '\n' +
+                    '- Tỷ lệ Cache Hit: ' + (stats.totalQueries > 0 ? Math.round((stats.cacheHits / stats.totalQueries) * 100) : 0) + '%\n' +
+                    '- Số lần SWR ngầm: ' + stats.swrHits + '\n' +
+                    '- Độ trễ trung bình: ' + Math.round(stats.averageLatency) + 'ms\n' +
+                    '- Kích thước cache hiện tại: ' + stats.cacheSize + ' bản ghi\n' +
+                    '- Uptime hoạt động: ' + Math.round(stats.uptime) + ' giây\n' +
+                    '- Trạng thái 10 Upstream DNS:\n' + upstreamsStr + '\n' +
+                    'Yêu cầu báo cáo gồm:\n' +
+                    '1. Đánh giá trạng thái tổng quan (Ví dụ: Tốt/Có nguy cơ/Chậm).\n' +
+                    '2. Phân tích các DNS Upstream nổi bật (nhà mạng nào nhanh, nhà mạng nào có lỗi).\n' +
+                    '3. Đề xuất hành động (ví dụ: cần làm gì trên thiết bị iOS/Android hoặc cài đặt lại vùng mạng).';
+
+                const reply = await queryGemini([{ role: 'user', content: prompt }]);
+                resultBox.innerHTML = '<strong>Báo cáo Phân tích từ Gemini AI:</strong><br>' + formatMarkdown(reply);
+            } catch (err) {
+                resultBox.innerHTML = '<span style="color: #ff453a;">Lỗi phân tích: ' + escapeHtml(err.message) + '</span><br><p style="font-size: 0.85rem; color: var(--text-muted); margin-top: 10px;">Lưu ý: Hãy chắc chắn dự án gemini-web-to-api đang chạy tại địa chỉ cấu hình và cookie đăng nhập đã chính xác.</p>';
+            }
+        }
+
+        function escapeHtml(str) {
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+        }
+
+        function formatMarkdown(text) {
+            return text
+                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                .replace(/\*(.*?)\*/g, '<em>$1</em>')
+                .replace(new RegExp('\\\\x60([^\\\\x60]+)\\\\x60', 'g'), '<code style="background: rgba(255,255,255,0.1); padding: 2px 4px; border-radius: 4px;">$1</code>')
+                .replace(/\n/g, '<br>')
+                .replace(/^- (.*)$/gm, '• $1');
         }
 
         fetchStats();
