@@ -1918,8 +1918,8 @@ const server = http.createServer(async (req, res) => {
 
         function formatMarkdown(text) {
             return text
-                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-                .replace(/\*(.*?)\*/g, '<em>$1</em>')
+                .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
+                .replace(/\\*(.*?)\\*/g, '<em>$1</em>')
                 .replace(new RegExp('\\\\x60([^\\\\x60]+)\\\\x60', 'g'), '<code style="background: rgba(255,255,255,0.1); padding: 2px 4px; border-radius: 4px;">$1</code>')
                 .replace(/\\n/g, '<br>')
                 .replace(/^- (.*)$/gm, '• $1');
