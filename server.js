@@ -970,7 +970,7 @@ const server = http.createServer(async (req, res) => {
             method: 'POST',
             headers,
             body: JSON.stringify({
-              model: model || 'gemini',
+              model: model === 'gemini' ? 'gemini-2.5-flash' : (model || 'gemini-2.5-flash'),
               messages
             })
           });
@@ -1593,7 +1593,7 @@ const server = http.createServer(async (req, res) => {
                 </div>
                 <div>
                     <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 5px; font-weight: 600;">Model sử dụng</label>
-                    <input type="text" id="ai-model" value="gemini" style="width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border-color); background: rgba(0,0,0,0.4); color: #fff; font-size: 0.85rem;" placeholder="gemini">
+                    <input type="text" id="ai-model" value="gemini-2.5-flash" style="width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border-color); background: rgba(0,0,0,0.4); color: #fff; font-size: 0.85rem;" placeholder="gemini-2.5-flash">
                 </div>
             </div>
 
