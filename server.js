@@ -948,7 +948,16 @@ const server = http.createServer(async (req, res) => {
           }
           
           const cleanEndpoint = apiEndpoint.endsWith('/') ? apiEndpoint.slice(0, -1) : apiEndpoint;
-          const targetUrl = `${cleanEndpoint}/chat/completions`;
+          
+          let targetUrl;
+          const isGeminiWebToApi = cleanEndpoint.includes('onrender.com') || cleanEndpoint.includes('localhost:4981') || cleanEndpoint.includes('127.0.0.1:4981');
+          
+          if (isGeminiWebToApi && !cleanEndpoint.includes('/openai')) {
+            const baseHost = cleanEndpoint.endsWith('/v1') ? cleanEndpoint.slice(0, -3) : cleanEndpoint;
+            targetUrl = `${baseHost}/openai/v1/chat/completions`;
+          } else {
+            targetUrl = cleanEndpoint.endsWith('/chat/completions') ? cleanEndpoint : `${cleanEndpoint}/chat/completions`;
+          }
           
           const headers = {
             'Content-Type': 'application/json'
