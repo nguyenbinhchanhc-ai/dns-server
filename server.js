@@ -895,7 +895,7 @@ const server = http.createServer(async (req, res) => {
               return;
             }
             
-            const reqModel = model === 'gemini' ? 'gemini-1.5-flash' : (model || 'gemini-1.5-flash');
+            const reqModel = (model === 'gemini' || model === 'gemini-3.5-flash') ? 'gemini-2.5-flash' : (model || 'gemini-2.5-flash');
             const targetUrl = `https://generativelanguage.googleapis.com/v1beta/models/${reqModel}:generateContent?key=${apiKey}`;
             
             const systemMessage = messages.find(m => m.role === 'system');
@@ -970,7 +970,7 @@ const server = http.createServer(async (req, res) => {
             method: 'POST',
             headers,
             body: JSON.stringify({
-              model: model === 'gemini' ? 'gemini-2.5-flash' : (model || 'gemini-2.5-flash'),
+              model: (model === 'gemini' || model === 'gemini-3.5-flash') ? 'gemini-2.5-flash' : (model || 'gemini-2.5-flash'),
               messages
             })
           });
@@ -1593,7 +1593,7 @@ const server = http.createServer(async (req, res) => {
                 </div>
                 <div>
                     <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 5px; font-weight: 600;">Model sử dụng</label>
-                    <input type="text" id="ai-model" value="gemini-2.5-flash" style="width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border-color); background: rgba(0,0,0,0.4); color: #fff; font-size: 0.85rem;" placeholder="gemini-2.5-flash">
+                    <input type="text" id="ai-model" value="gemini-3.5-flash" style="width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border-color); background: rgba(0,0,0,0.4); color: #fff; font-size: 0.85rem;" placeholder="gemini-3.5-flash">
                 </div>
             </div>
 
