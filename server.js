@@ -111,7 +111,7 @@ function selectWeightedUpstream(candidates) {
     const scoreVal = Math.max(1, c.score);
     return {
       candidate: c,
-      value: Math.pow(1000 / scoreVal, 2.0) // Exponent 2.0 to favor faster and more stable upstreams strongly
+      value: Math.pow(1000 / scoreVal, 1.5) // Exponent 1.5 to favor faster and more stable upstreams while keeping load shared
     };
   });
 
@@ -454,7 +454,7 @@ function generateUUID() {
     const r = Math.random() * 16 | 0;
     const v = c === 'x' ? r : (r & 0x3 | 0x8);
     return v.toString(16);
-  });
+  }).toUpperCase();
 }
 
 // Periodic cleanup of expired cache entries (every 2 minutes)
@@ -749,6 +749,13 @@ const server = http.createServer(async (req, res) => {
                 <string>HTTPS</string>
                 <key>ServerURL</key>
                 <string>https://${host}/dns-query</string>
+                <key>ServerAddresses</key>
+                <array>
+                    <string>1.1.1.1</string>
+                    <string>1.0.0.1</string>
+                    <string>8.8.8.8</string>
+                    <string>8.8.4.4</string>
+                </array>
                 <key>ProhibitFallback</key>
                 <true/>
             </dict>
@@ -758,6 +765,8 @@ const server = http.createServer(async (req, res) => {
             <string>Antigravity DNS Accelerator</string>
             <key>PayloadIdentifier</key>
             <string>com.antigravity.dns.doh</string>
+            <key>PayloadOrganization</key>
+            <string>Antigravity</string>
             <key>PayloadType</key>
             <string>com.apple.dnsSettings.managed</string>
             <key>PayloadUUID</key>
@@ -766,10 +775,14 @@ const server = http.createServer(async (req, res) => {
             <integer>1</integer>
         </dict>
     </array>
+    <key>PayloadDescription</key>
+    <string>Cấu hình mã hóa DNS over HTTPS hỗ trợ tăng tốc độ và bảo mật mạng di động/WiFi.</string>
     <key>PayloadDisplayName</key>
     <string>Antigravity DNS Accelerator</string>
     <key>PayloadIdentifier</key>
     <string>com.antigravity.dns</string>
+    <key>PayloadOrganization</key>
+    <string>Antigravity</string>
     <key>PayloadRemovalDisallowed</key>
     <false/>
     <key>PayloadType</key>
