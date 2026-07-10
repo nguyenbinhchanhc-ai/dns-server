@@ -1201,7 +1201,10 @@ const server = http.createServer(async (req, res) => {
         </div>
 
         <div class="main-panel">
-            <h2>Bảng hiệu năng thích ứng (Adaptive DNS & Racing Leaderboard)</h2>
+            <h2 style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                <span>Bảng hiệu năng thích ứng (Adaptive DNS & Racing Leaderboard)</span>
+                <a href="/api/test-dns" target="_blank" style="font-size: 0.8rem; padding: 6px 12px; border: 1px dashed var(--accent-glow); border-radius: 8px; color: var(--accent-glow); text-decoration: none; transition: all 0.2s;" onmouseover="this.style.background='var(--accent-glow)'; this.style.color='#000'" onmouseout="this.style.background='none'; this.style.color='var(--accent-glow)'">🔍 Quét các DNS Việt Nam</a>
+            </h2>
             <div class="table-container">
                 <table>
                     <thead>
