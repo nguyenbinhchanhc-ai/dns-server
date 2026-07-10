@@ -162,15 +162,26 @@ function selectWeightedUpstream(candidates) {
 // In-Memory DNS Cache (Key: name:type:class)
 const cache = new Map();
 
+function safeCacheSet(key, value) {
+  if (cache.size >= 25000) {
+    const firstKey = cache.keys().next().value;
+    if (firstKey) cache.delete(firstKey);
+  }
+  cache.set(key, value);
+}
+
 // Active background revalidations to prevent duplicate requests
 const activeRevalidations = new Set();
+
+// Request Coalescing registry to prevent query amplification under concurrent loads
+const coalescedQueries = new Map();
 
 // Active Pending Upstream Queries (UDP mapping)
 const pendingQueries = new Map();
 let nextTxId = 1;
 
-// Initialize a pool of 5 outgoing UDP sockets to prevent I/O bottlenecks under load
-const SOCKET_POOL_SIZE = 5;
+// Initialize a pool of 15 outgoing UDP sockets to prevent I/O bottlenecks under concurrent load
+const SOCKET_POOL_SIZE = 15;
 const socketPool = [];
 let nextSocketIndex = 0;
 
@@ -573,7 +584,7 @@ function prefetchDomain(name, type = 'A') {
         const minTtl = getMinTTL(dnsRes);
         const key = getCacheKey(dnsRes);
         if (key) {
-          cache.set(key, {
+          safeCacheSet(key, {
             buffer: responseBuffer,
             cachedAt: Date.now(),
             originalTtl: minTtl,
@@ -723,7 +734,7 @@ async function handleDoH(queryBuffer, clientIp) {
                   const isNxDomain = dnsRespObj.rcode === 'NXDOMAIN';
                   const cacheTtl = isNxDomain ? 30 : ttl;
 
-                  cache.set(cacheKey, {
+                  safeCacheSet(cacheKey, {
                     buffer: responseBuffer,
                     cachedAt: Date.now(),
                     originalTtl: cacheTtl,
@@ -757,6 +768,20 @@ async function handleDoH(queryBuffer, clientIp) {
 
   // 2. Cache Miss: Run Upstream Race
   stats.cacheMisses++;
+
+  // Request Coalescing: Check if there is already an active outgoing query for the same domain
+  if (cacheKey && coalescedQueries.has(cacheKey)) {
+    const clientTxId = queryBuffer.readUInt16BE(0);
+    return new Promise((resolve, reject) => {
+      coalescedQueries.get(cacheKey).push({ resolve, reject, clientTxId });
+    });
+  }
+
+  const waiters = [];
+  if (cacheKey) {
+    coalescedQueries.set(cacheKey, waiters);
+  }
+
   try {
     const { responseBuffer, from } = await raceDNS(queryBuffer, 1200);
     const latency = Date.now() - startTime;
@@ -772,7 +797,7 @@ async function handleDoH(queryBuffer, clientIp) {
         const isNxDomain = dnsRespObj.rcode === 'NXDOMAIN';
         const cacheTtl = isNxDomain ? 30 : ttl; // Cache NXDOMAIN for 30 seconds
 
-        cache.set(cacheKey, {
+        safeCacheSet(cacheKey, {
           buffer: responseBuffer,
           cachedAt: Date.now(),
           originalTtl: cacheTtl,
@@ -781,11 +806,28 @@ async function handleDoH(queryBuffer, clientIp) {
       } catch (e) {
         // Non-fatal cache failure
       }
+
+      // Resolve all waiters in coalesced group
+      coalescedQueries.delete(cacheKey);
+      waiters.forEach(w => {
+        const resp = Buffer.from(responseBuffer);
+        resp.writeUInt16BE(w.clientTxId, 0);
+        w.resolve(resp);
+      });
     }
 
     return responseBuffer;
   } catch (err) {
     stats.errors++;
+    
+    // Reject all waiters in coalesced group on failure
+    if (cacheKey) {
+      coalescedQueries.delete(cacheKey);
+      waiters.forEach(w => {
+        w.reject(err);
+      });
+    }
+
     try {
       const decodedQuery = dnsPacket.decode(queryBuffer);
       const servFailPacket = dnsPacket.encode({
