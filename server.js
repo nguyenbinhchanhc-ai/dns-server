@@ -749,13 +749,6 @@ const server = http.createServer(async (req, res) => {
                 <string>HTTPS</string>
                 <key>ServerURL</key>
                 <string>https://${host}/dns-query</string>
-                <key>ServerAddresses</key>
-                <array>
-                    <string>1.1.1.1</string>
-                    <string>1.0.0.1</string>
-                    <string>8.8.8.8</string>
-                    <string>8.8.4.4</string>
-                </array>
                 <key>ProhibitFallback</key>
                 <true/>
             </dict>
