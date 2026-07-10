@@ -88,68 +88,7 @@ async function runTests() {
     
     console.log('=> TEST 3: PASS');
 
-    // --- CA KIỂM THỬ 4: Xác minh AI tiên đoán hành vi và Prefetch ---
-    console.log('\n[TEST 4]: Kiểm tra AI tiên đoán hành vi và Prefetch...');
-    
-    // Học hành vi: Gửi original-domain.com rồi đến predicted-cdn.com (3 lần)
-    for (let j = 0; j < 3; j++) {
-      const q1 = dnsPacket.encode({
-        type: 'query', id: 7000 + j, flags: dnsPacket.RECURSION_DESIRED,
-        questions: [{ type: 'A', name: 'original-domain.com' }]
-      });
-      await fetch(`${url}/dns-query`, { method: 'POST', body: q1 });
-      
-      const q2 = dnsPacket.encode({
-        type: 'query', id: 8000 + j, flags: dnsPacket.RECURSION_DESIRED,
-        questions: [{ type: 'A', name: 'predicted-cdn.com' }]
-      });
-      await fetch(`${url}/dns-query`, { method: 'POST', body: q2 });
-    }
-    
-    // Lần thứ 4: Chỉ gửi original-domain.com để kích hoạt AI prefetch predicted-cdn.com ngầm
-    const qTest = dnsPacket.encode({
-      type: 'query', id: 9000, flags: dnsPacket.RECURSION_DESIRED,
-      questions: [{ type: 'A', name: 'original-domain.com' }]
-    });
-    await fetch(`${url}/dns-query`, { method: 'POST', body: qTest });
-    
-    // Đợi 200ms để AI xử lý prefetch ngầm
-    await new Promise(resolve => setTimeout(resolve, 200));
-    
-    // Gửi yêu cầu predicted-cdn.com và đo thời gian (phải lấy từ cache < 15ms)
-    const qCdn = dnsPacket.encode({
-      type: 'query', id: 9001, flags: dnsPacket.RECURSION_DESIRED,
-      questions: [{ type: 'A', name: 'predicted-cdn.com' }]
-    });
-    const prefetchStartTime = Date.now();
-    const resCdn = await fetch(`${url}/dns-query`, { method: 'POST', body: qCdn });
-    const prefetchDuration = Date.now() - prefetchStartTime;
-    
-    console.log(`=> Thời gian phản hồi cdn được prefetch: ${prefetchDuration}ms`);
-    if (!resCdn.ok) throw new Error('Query cdn thất bại');
-    
-    // Kiểm tra cấu trúc API /api/stats có chứa các hoạt động của AI
-    const aiStatsRes = await fetch(`${url}/api/stats`);
-    const aiStatsObj = await aiStatsRes.json();
-    console.log(`=> Danh sách hoạt động AI ghi nhận được: ${aiStatsObj.aiActivities.length} dòng`);
-    if (!aiStatsObj.aiActivities || aiStatsObj.aiActivities.length === 0) {
-      throw new Error('LỖI: Không tìm thấy ghi chép hoạt động của AI!');
-    }
-    
-    console.log('=> TEST 4: PASS');
 
-    // --- CA KIỂM THỬ 5: Xác minh AI Chat Proxy Handler ---
-    console.log('\n[TEST 5]: Kiểm tra AI Chat Proxy Handler...');
-    
-    // Gửi một yêu cầu chat trống để kiểm tra endpoint phản ứng lỗi 400 khi thiếu apiEndpoint
-    const chatErrRes = await fetch(`${url}/api/ai-chat`, {
-      method: 'POST',
-      body: JSON.stringify({ messages: [] })
-    });
-    console.log(`=> Mã lỗi phản hồi (mong đợi 400): ${chatErrRes.status}`);
-    if (chatErrRes.status !== 400) throw new Error('Query AI Chat không trả về lỗi 400 khi thiếu cấu hình');
-    
-    console.log('=> TEST 5: PASS');
 
   } catch (err) {
     console.error('\n❌ PHÁT HIỆN LỖI KIỂM THỬ:', err.message);

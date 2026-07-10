@@ -44,6 +44,7 @@ const upstreamStates = UPSTREAMS.map(dns => ({
   realErrorsCount: 0,
   
   penalty: 0,             // Active penalty (ms) for errors, decays over time
+  jitter: 0,              // Standard deviation of ping latencies
   score: 120,             // Score = avgLatency + lossRate*5 + penalty
   routedQueries: 0,       // Total client queries won by this upstream
   status: 'Healthy'
@@ -93,60 +94,24 @@ function updateCandidates() {
   activeCandidates = sorted; // Expand to all active candidates to allow 10 DNS servers load sharing
 }
 
-// AI Operations Activity Log (Neon-themed Web UI log)
-const aiActivities = [];
-
-function logAiActivity(type, message) {
-  const d = new Date();
-  const h = String(d.getHours()).padStart(2, '0');
-  const m = String(d.getMinutes()).padStart(2, '0');
-  const s = String(d.getSeconds()).padStart(2, '0');
-  const timeStr = `${h}:${m}:${s}`;
-
-  aiActivities.unshift({
-    time: timeStr,
-    type,
-    message
-  });
-  if (aiActivities.length > 15) aiActivities.pop();
+// Helper to calculate standard deviation (jitter) of ping samples
+function getJitter(samples) {
+  if (samples.length < 2) return 0;
+  const mean = samples.reduce((sum, v) => sum + v, 0) / samples.length;
+  const variance = samples.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / samples.length;
+  return Math.round(Math.sqrt(variance));
 }
 
-// Domain-Specific DNS Latency records (domain -> Map(dnsIp -> latency))
-const domainDnsLatency = new Map();
-let lastRouterLogTime = 0;
-
-// Dynamic Latency-Sensitive Weighting + Domain-Peering AI Routing
-// Selects best upstream based on global stats, adjusted by domain-specific historical latency
-function selectWeightedUpstream(candidates, domain) {
+// Dynamic Latency-Sensitive Weighting: Selects best upstream based on scores (RTT + Loss + Penalty + Jitter)
+function selectWeightedUpstream(candidates) {
   if (!candidates || candidates.length === 0) return null;
   if (candidates.length === 1) return candidates[0];
 
-  const domainMap = domain ? domainDnsLatency.get(domain) : null;
-  let loggedRouter = false;
-
   const weights = candidates.map(c => {
-    let score = c.score;
-    
-    // AI Domain-Peering Tuning: Blend global score with historical domain-specific latency (50-50 weight)
-    if (domainMap && domainMap.has(c.ip)) {
-      const histLat = domainMap.get(c.ip);
-      score = Math.round(0.5 * score + 0.5 * (histLat + c.lossRate * 5 + c.penalty));
-      
-      const now = Date.now();
-      if (now - lastRouterLogTime > 4000 && !loggedRouter) {
-        const dnsName = c.name;
-        setImmediate(() => {
-          logAiActivity('ROUTER', `Định tuyến AI: ${domain} ➔ ${dnsName} (Tối ưu lịch sử: ${histLat}ms)`);
-        });
-        lastRouterLogTime = now;
-        loggedRouter = true;
-      }
-    }
-    
-    const scoreVal = Math.max(1, score);
+    const scoreVal = Math.max(1, c.score);
     return {
       candidate: c,
-      value: Math.pow(1000 / scoreVal, 1.5)
+      value: Math.pow(1000 / scoreVal, 2.0) // Exponent 2.0 to favor faster and more stable upstreams strongly
     };
   });
 
@@ -297,12 +262,16 @@ async function performHealthChecks() {
       ? Math.round(validPings.reduce((a, b) => a + b, 0) / validPings.length)
       : 1000;
 
+    const jitter = getJitter(validPings);
+    state.jitter = jitter;
+    const jitterPenalty = jitter > 15 ? jitter * 2 : 0;
+
     const lostCount = state.pings.filter(p => p === 1000).length;
     state.lossRate = Math.round((lostCount / state.pings.length) * 100);
 
     state.penalty = Math.max(0, Math.round(state.penalty * 0.5));
 
-    state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
+    state.score = state.avgLatency + (state.lossRate * 5) + state.penalty + jitterPenalty;
 
     if (state.lossRate >= 60) {
       state.status = 'Offline';
@@ -323,7 +292,7 @@ setInterval(performHealthChecks, 25000);
 setInterval(updateCandidates, 5000); // Update rankings every 5s to keep CPU low
 
 // Perform DNS routing using Dynamic Weighted Load Balancing + Speculative Backup Retry (Dynamic delay)
-function raceDNS(queryBuffer, timeoutMs = 1200, domain) {
+function raceDNS(queryBuffer, timeoutMs = 1200) {
   return new Promise((resolve, reject) => {
     const candidates = activeCandidates;
     if (candidates.length === 0) {
@@ -340,8 +309,8 @@ function raceDNS(queryBuffer, timeoutMs = 1200, domain) {
 
     const startTime = Date.now();
 
-    // Select primary dynamically by weights and domain-peering AI
-    const primary = selectWeightedUpstream(candidates, domain);
+    // Select primary dynamically by weights
+    const primary = selectWeightedUpstream(candidates);
     let backupStarted = false;
     let backupTimer = null;
 
@@ -353,7 +322,8 @@ function raceDNS(queryBuffer, timeoutMs = 1200, domain) {
       queried.forEach(state => {
         state.realErrorsCount++;
         state.penalty = Math.min(1000, state.penalty + 250);
-        state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
+        const jitterPenalty = state.jitter > 15 ? state.jitter * 2 : 0;
+        state.score = state.avgLatency + (state.lossRate * 5) + state.penalty + jitterPenalty;
       });
 
       reject(new Error('DNS query timeout'));
@@ -379,7 +349,8 @@ function raceDNS(queryBuffer, timeoutMs = 1200, domain) {
           winner.realQueriesCount++;
           
           winner.penalty = Math.max(0, winner.penalty - 25);
-          winner.score = winner.avgLatency + (winner.lossRate * 5) + winner.penalty;
+          const jitterPenalty = winner.jitter > 15 ? winner.jitter * 2 : 0;
+          winner.score = winner.avgLatency + (winner.lossRate * 5) + winner.penalty + jitterPenalty;
         }
 
         resolve({ responseBuffer, from });
@@ -393,7 +364,8 @@ function raceDNS(queryBuffer, timeoutMs = 1200, domain) {
         queried.forEach(state => {
           state.realErrorsCount++;
           state.penalty = Math.min(1000, state.penalty + 200);
-          state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
+          const jitterPenalty = state.jitter > 15 ? state.jitter * 2 : 0;
+          state.score = state.avgLatency + (state.lossRate * 5) + state.penalty + jitterPenalty;
         });
 
         reject(err);
@@ -495,98 +467,7 @@ setInterval(() => {
   }
 }, 120000);
 
-// Lightweight AI Markov Chain Behavior Predictor for DNS Prefetching
-const transitionModel = new Map(); // domainA -> Map(domainB -> count)
-let lastDomainName = null;
-let lastDomainTime = 0;
 
-function recordTransition(prev, current) {
-  if (!prev || !current || prev === current) return;
-  
-  let nextMap = transitionModel.get(prev);
-  if (!nextMap) {
-    nextMap = new Map();
-    transitionModel.set(prev, nextMap);
-  }
-  
-  const count = nextMap.get(current) || 0;
-  nextMap.set(current, count + 1);
-  
-  if (count + 1 === 3) {
-    logAiActivity('LEARNER', `Liên kết chuỗi lướt web: ${prev} ➔ ${current}`);
-  }
-  
-  // Keep memory bounded: limit next list to 5 items max per node
-  if (nextMap.size > 5) {
-    let lowestKey = null;
-    let lowestVal = Infinity;
-    for (const [k, v] of nextMap.entries()) {
-      if (v < lowestVal) {
-        lowestVal = v;
-        lowestKey = k;
-      }
-    }
-    if (lowestKey) nextMap.delete(lowestKey);
-  }
-}
-
-function predictAndPrefetch(currentDomain) {
-  const nextMap = transitionModel.get(currentDomain);
-  if (!nextMap) return;
-  
-  // Find top predictions
-  const sortedNext = [...nextMap.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 2); // Prefetch top 2 domains
-    
-  for (const [nextDomain, count] of sortedNext) {
-    if (count >= 3) { // Proactive threshold: 3 hits
-      const cacheKey = `${nextDomain}:1:IN`; // A-record cache key
-      if (!cache.has(cacheKey) && !activeRevalidations.has(cacheKey)) {
-        activeRevalidations.add(cacheKey);
-        
-        logAiActivity('PREFETCH', `Tải ngầm dự phòng: ${nextDomain} (Dự đoán từ ${currentDomain})`);
-        
-        const prefetchPacket = dnsPacket.encode({
-          type: 'query',
-          id: Math.floor(Math.random() * 65535),
-          flags: dnsPacket.RECURSION_DESIRED,
-          questions: [{
-            type: 'A',
-            name: nextDomain
-          }]
-        });
-        
-        // Pass nextDomain to raceDNS for domain-peering routing
-        raceDNS(prefetchPacket, 1200, nextDomain)
-          .then(({ responseBuffer, from }) => {
-            try {
-              const dnsRespObj = dnsPacket.decode(responseBuffer);
-              const ttl = getMinTTL(dnsRespObj);
-              
-              const isNxDomain = dnsRespObj.rcode === 'NXDOMAIN';
-              const cacheTtl = isNxDomain ? 30 : ttl;
-
-              cache.set(cacheKey, {
-                buffer: responseBuffer,
-                cachedAt: Date.now(),
-                originalTtl: cacheTtl,
-                expiresAt: Date.now() + cacheTtl * 1000
-              });
-
-              const provider = upstreamStates.find(s => s.ip === from);
-              const savedMs = provider ? provider.avgLatency : 45;
-              logAiActivity('CACHE', `Làm nóng cache thành công: ${nextDomain} (Lưu từ ${provider ? provider.name : 'DNS'} | Tiết kiệm ~${savedMs}ms)`);
-            } catch (e) {}
-          })
-          .catch(() => {})
-          .finally(() => {
-            activeRevalidations.delete(cacheKey);
-          });
-      }
-    }
-  }
-}
 
 function isValidPublicIp(ip) {
   if (!ip) return false;
@@ -612,28 +493,6 @@ async function handleDoH(queryBuffer, clientIp) {
   } catch (err) {
     stats.errors++;
     throw new Error('Format Error: Failed to parse DNS query');
-  }
-
-  const domain = dnsQueryObj.questions && dnsQueryObj.questions.length > 0
-    ? dnsQueryObj.questions[0].name.toLowerCase()
-    : null;
-
-  // Lightweight AI Behavior Predictor: defer learning and prefetching asynchronously via setImmediate
-  if (domain) {
-    setImmediate(() => {
-      try {
-        const now = Date.now();
-        if (lastDomainName && (now - lastDomainTime < 5000)) {
-          recordTransition(lastDomainName, domain);
-        }
-        lastDomainName = domain;
-        lastDomainTime = now;
-        
-        predictAndPrefetch(domain);
-      } catch (e) {
-        // Silently catch to avoid crashing critical path
-      }
-    });
   }
 
   // EDNS Client Subnet (ECS) Routing: Inject client's real public IP prefix to allow upstreams/CDNs 
@@ -702,7 +561,7 @@ async function handleDoH(queryBuffer, clientIp) {
           
           // Trigger asynchronous background revalidation
           setTimeout(() => {
-            raceDNS(queryBuffer, 1200, domain)
+            raceDNS(queryBuffer, 1200)
               .then(({ responseBuffer }) => {
                 try {
                   const dnsRespObj = dnsPacket.decode(responseBuffer);
@@ -746,21 +605,10 @@ async function handleDoH(queryBuffer, clientIp) {
   // 2. Cache Miss: Run Upstream Race
   stats.cacheMisses++;
   try {
-    const { responseBuffer, from } = await raceDNS(queryBuffer, 1200, domain);
+    const { responseBuffer, from } = await raceDNS(queryBuffer, 1200);
     const latency = Date.now() - startTime;
     stats.totalLatency += latency;
     stats.averageLatency = stats.totalLatency / stats.totalQueries;
-
-    // AI Domain-Peering: update specific domain latency mapping for the winning DNS
-    if (from && domain) {
-      let domainMap = domainDnsLatency.get(domain);
-      if (!domainMap) {
-        domainMap = new Map();
-        domainDnsLatency.set(domain, domainMap);
-      }
-      const currentEma = domainMap.get(from) || latency;
-      domainMap.set(from, Math.round(0.3 * latency + 0.7 * currentEma));
-    }
 
     // Cache response (success or NXDOMAIN negative caching)
     if (cacheKey) {
@@ -870,133 +718,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Endpoint 1.5: AI Chat Proxy Handler
-  if (parsedUrl.pathname === '/api/ai-chat') {
-    if (req.method === 'POST') {
-      let bodyChunks = [];
-      req.on('data', chunk => bodyChunks.push(chunk));
-      req.on('end', async () => {
-        try {
-          const body = JSON.parse(Buffer.concat(bodyChunks).toString());
-          const { apiEndpoint, apiKey, model, messages } = body;
-          
-          if (!apiEndpoint) {
-            res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
-            res.end('Thiếu apiEndpoint');
-            return;
-          }
-
-          const isOfficialGemini = (apiKey && apiKey.startsWith('AIzaSy')) || apiEndpoint.includes('generativelanguage.googleapis.com');
-          
-          if (isOfficialGemini) {
-            if (!apiKey) {
-              res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
-              res.end('Thiếu API Key cho Google AI Studio');
-              return;
-            }
-            
-            const reqModel = (model === 'gemini' || model === 'gemini-3.5-flash') ? 'gemini-2.5-flash' : (model || 'gemini-2.5-flash');
-            const targetUrl = `https://generativelanguage.googleapis.com/v1beta/models/${reqModel}:generateContent?key=${apiKey}`;
-            
-            const systemMessage = messages.find(m => m.role === 'system');
-            const systemInstruction = systemMessage ? { parts: [{ text: systemMessage.content }] } : undefined;
-            
-            const chatContents = messages
-              .filter(m => m.role !== 'system')
-              .map(m => ({
-                role: m.role === 'assistant' ? 'model' : 'user',
-                parts: [{ text: m.content }]
-              }));
-              
-            const response = await fetch(targetUrl, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                contents: chatContents,
-                systemInstruction
-              })
-            });
-            
-            if (!response.ok) {
-              const errText = await response.text();
-              res.writeHead(response.status, { 'Content-Type': 'text/plain; charset=utf-8' });
-              res.end(`Lỗi kết nối Official Gemini API: ${errText}`);
-              return;
-            }
-            
-            const resJson = await response.json();
-            if (!resJson.candidates || resJson.candidates.length === 0 || !resJson.candidates[0].content) {
-              res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-              res.end('Phản hồi trống từ Google API. Hãy kiểm tra lại API Key hoặc tên model.');
-              return;
-            }
-            
-            const replyText = resJson.candidates[0].content.parts[0].text;
-            const mappedResponse = {
-              choices: [
-                {
-                  message: {
-                    role: 'assistant',
-                    content: replyText
-                  }
-                }
-              ]
-            };
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify(mappedResponse));
-            return;
-          }
-          
-          const cleanEndpoint = apiEndpoint.endsWith('/') ? apiEndpoint.slice(0, -1) : apiEndpoint;
-          
-          let targetUrl;
-          const isGeminiWebToApi = cleanEndpoint.includes('onrender.com') || cleanEndpoint.includes('localhost:4981') || cleanEndpoint.includes('127.0.0.1:4981');
-          
-          if (isGeminiWebToApi && !cleanEndpoint.includes('/openai')) {
-            const baseHost = cleanEndpoint.endsWith('/v1') ? cleanEndpoint.slice(0, -3) : cleanEndpoint;
-            targetUrl = `${baseHost}/openai/v1/chat/completions`;
-          } else {
-            targetUrl = cleanEndpoint.endsWith('/chat/completions') ? cleanEndpoint : `${cleanEndpoint}/chat/completions`;
-          }
-          
-          const headers = {
-            'Content-Type': 'application/json'
-          };
-          if (apiKey) {
-            headers['Authorization'] = `Bearer ${apiKey}`;
-          }
-          
-          const response = await fetch(targetUrl, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-              model: (model === 'gemini' || model === 'gemini-3.5-flash') ? 'gemini-2.5-flash' : (model || 'gemini-2.5-flash'),
-              messages
-            })
-          });
-          
-          if (!response.ok) {
-            const errText = await response.text();
-            res.writeHead(response.status, { 'Content-Type': 'text/plain; charset=utf-8' });
-            res.end(`Lỗi kết nối Gemini API: ${errText}`);
-            return;
-          }
-          
-          const resJson = await response.json();
-          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify(resJson));
-        } catch (err) {
-          res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-          res.end(err.message);
-        }
-      });
-    } else {
-      res.writeHead(405, { 'Content-Type': 'text/plain' });
-      res.end('Method Not Allowed');
-    }
-    return;
-  }
-
   // Endpoint 2: JSON API Stats (Includes detailed load balance & SWR data)
   if (parsedUrl.pathname === '/api/stats') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1005,8 +726,7 @@ const server = http.createServer(async (req, res) => {
       upstreams: upstreamStates,
       poolSize: currentPoolSize,
       cacheSize: cache.size,
-      uptime: process.uptime(),
-      aiActivities: aiActivities
+      uptime: process.uptime()
     }));
     return;
   }
@@ -1574,57 +1294,7 @@ const server = http.createServer(async (req, res) => {
             </div>
         </div>
 
-        <div class="main-panel" style="border: 1px solid rgba(139, 92, 246, 0.25); background: rgba(15, 10, 30, 0.5); box-shadow: 0 0 15px rgba(139, 92, 246, 0.05); margin-top: 10px;">
-            <h2 style="color: #a78bfa; display: flex; align-items: center; gap: 10px;">
-                🧠 Trợ lý Phân tích & Trò chuyện Gemini AI
-            </h2>
-            <p style="font-size: 0.9rem; color: var(--text-muted); margin-bottom: 20px;">
-                Tích hợp bộ não AI từ dự án <a href="https://github.com/ntthanh2603/gemini-web-to-api" target="_blank" style="color: #c084fc; text-decoration: underline;">gemini-web-to-api</a> để phân tích sức khỏe mạng và trò chuyện hỗ trợ vận hành.
-            </p>
-            
-            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; background: rgba(0,0,0,0.25); padding: 15px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.05);">
-                <div>
-                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 5px; font-weight: 600;">Địa chỉ API Bộ não</label>
-                    <input type="text" id="ai-endpoint" value="http://localhost:4981/v1" style="width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border-color); background: rgba(0,0,0,0.4); color: #fff; font-size: 0.85rem;" placeholder="http://localhost:4981/v1">
-                </div>
-                <div>
-                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 5px; font-weight: 600;">API Key (Nếu có)</label>
-                    <input type="password" id="ai-key" style="width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border-color); background: rgba(0,0,0,0.4); color: #fff; font-size: 0.85rem;" placeholder="Bỏ trống nếu chạy Docker local">
-                </div>
-                <div>
-                    <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 5px; font-weight: 600;">Model sử dụng</label>
-                    <input type="text" id="ai-model" value="gemini-3.5-flash" style="width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border-color); background: rgba(0,0,0,0.4); color: #fff; font-size: 0.85rem;" placeholder="gemini-3.5-flash">
-                </div>
-            </div>
 
-            <div style="display: flex; gap: 15px; margin-bottom: 20px;">
-                <button class="btn-copy" onclick="analyzeNetwork()" style="background: rgba(139, 92, 246, 0.15); border-color: rgba(139, 92, 246, 0.3); color: #c084fc; font-weight: 600; padding: 10px 20px;">📊 AI Phân tích hiệu năng mạng</button>
-            </div>
-
-            <div id="ai-analysis-result" style="display: none; background: rgba(0,0,0,0.2); border: 1px solid rgba(139, 92, 246, 0.2); border-radius: 12px; padding: 20px; font-size: 0.9rem; line-height: 1.6; margin-bottom: 25px; max-height: 300px; overflow-y: auto; text-align: left;">
-                <!-- AI insights render here -->
-            </div>
-
-            <div style="border: 1px solid rgba(255,255,255,0.05); border-radius: 12px; overflow: hidden; background: rgba(0,0,0,0.2);">
-                <div id="ai-chat-history" style="height: 250px; overflow-y: auto; padding: 15px; display: flex; flex-direction: column; gap: 12px; font-size: 0.9rem; text-align: left;">
-                    <div style="color: var(--text-muted); text-align: center; margin-top: 80px;">Trò chuyện với trợ lý Gemini AI... Hỏi tôi bất cứ câu hỏi nào về hệ thống DNS này!</div>
-                </div>
-                <div style="display: flex; border-top: 1px solid rgba(255,255,255,0.05);">
-                    <input type="text" id="ai-chat-input" style="flex: 1; padding: 15px; background: rgba(0,0,0,0.3); border: none; color: #fff; font-size: 0.9rem;" placeholder="Hỏi Gemini..." onkeydown="if(event.key === 'Enter') sendAiChat()">
-                    <button onclick="sendAiChat()" style="padding: 0 25px; background: #8b5cf6; border: none; color: #fff; font-weight: 600; cursor: pointer; transition: background 0.2s;">Gửi</button>
-                </div>
-            </div>
-        </div>
-
-        <div class="main-panel" style="border: 1px solid rgba(0, 247, 255, 0.2); background: rgba(0, 8, 16, 0.5); box-shadow: 0 0 15px rgba(0, 247, 255, 0.05); margin-top: 10px;">
-            <h2 style="color: var(--accent-glow); display: flex; align-items: center; gap: 10px;">
-                <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background-color: var(--accent-solid); box-shadow: 0 0 8px var(--accent-solid); animation: pulse 1.5s infinite;"></span>
-                Nhật ký hoạt động của AI Engine (Markov Predictor & Peering Router)
-            </h2>
-            <div id="ai-log-container" style="max-height: 220px; overflow-y: auto; font-family: monospace; font-size: 0.85rem; padding: 15px; border-radius: 12px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.05); display: flex; flex-direction: column; gap: 8px; scroll-behavior: smooth;">
-                <!-- Renders dynamically -->
-            </div>
-        </div>
 
         <footer>
             <p>Thuật toán tối ưu SWR Caching & Dynamic Jitter Racing. Phát triển bởi Antigravity Coding Engine v3.</p>
@@ -1749,180 +1419,8 @@ const server = http.createServer(async (req, res) => {
                     tableBody.appendChild(row);
                 });
 
-                // Render AI Operations Log
-                const aiLog = document.getElementById('ai-log-container');
-                aiLog.innerHTML = '';
-                const activities = data.aiActivities || [];
-                if (activities.length === 0) {
-                    aiLog.innerHTML = '<div style="color: var(--text-muted); text-align: center; padding: 20px;">AI đang phân tích và tối ưu hóa luồng dữ liệu...</div>';
-                } else {
-                    activities.forEach(act => {
-                        let color = '#fff';
-                        if (act.type === 'LEARNER') color = '#a78bfa'; // Purple
-                        else if (act.type === 'PREFETCH') color = '#38bdf8'; // Blue
-                        else if (act.type === 'CACHE') color = '#34d399'; // Green
-                        else if (act.type === 'ROUTER') color = '#fbbf24'; // Yellow
-                        
-                        const div = document.createElement('div');
-                        div.style.lineHeight = '1.5';
-                        div.innerHTML = '<span style="color: var(--text-muted); font-variant-numeric: tabular-nums;">[' + act.time + ']</span> ' +
-                            '<span style="color: ' + color + '; font-weight: bold; margin-right: 5px;">[AI ' + act.type + ']</span> ' +
-                            '<span>' + act.message + '</span>';
-                        aiLog.appendChild(div);
-                    });
-                }
-
-            } catch (err) {
-                console.error('Error loading stats:', err);
-            }
-        }
-
-        // Save/Load API Configuration
-        window.addEventListener('DOMContentLoaded', () => {
-            const savedEndpoint = localStorage.getItem('ai_endpoint');
-            const savedKey = localStorage.getItem('ai_key');
-            const savedModel = localStorage.getItem('ai_model');
-
-            if (savedEndpoint) document.getElementById('ai-endpoint').value = savedEndpoint;
-            if (savedKey) document.getElementById('ai-key').value = savedKey;
-            if (savedModel) document.getElementById('ai-model').value = savedModel;
-        });
-
-        function saveConfig() {
-            const ep = document.getElementById('ai-endpoint').value;
-            const key = document.getElementById('ai-key').value;
-            const model = document.getElementById('ai-model').value;
-
-            localStorage.setItem('ai_endpoint', ep);
-            localStorage.setItem('ai_key', key);
-            localStorage.setItem('ai_model', model);
-            return { ep, key, model };
-        }
-
-        async function queryGemini(messages) {
-            const config = saveConfig();
-            
-            const response = await fetch('/api/ai-chat', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    apiEndpoint: config.ep,
-                    apiKey: config.key,
-                    model: config.model,
-                    messages: messages
-                })
-            });
-
-            if (!response.ok) {
-                const errText = await response.text();
-                throw new Error(errText);
-            }
-
-            const data = await response.json();
-            return data.choices[0].message.content;
-        }
-
-        let chatMessages = [];
-
-        async function sendAiChat() {
-            const input = document.getElementById('ai-chat-input');
-            const query = input.value.trim();
-            if (!query) return;
-
-            input.value = '';
-            
-            const chatHistory = document.getElementById('ai-chat-history');
-            if (chatMessages.length === 0) chatHistory.innerHTML = '';
-
-            // Render User message
-            const userDiv = document.createElement('div');
-            userDiv.style.alignSelf = 'flex-end';
-            userDiv.style.background = 'rgba(139, 92, 246, 0.2)';
-            userDiv.style.padding = '10px 15px';
-            userDiv.style.borderRadius = '12px 12px 0 12px';
-            userDiv.style.maxWidth = '80%';
-            userDiv.style.marginBottom = '8px';
-            userDiv.innerHTML = '<strong>Bạn:</strong><br>' + escapeHtml(query);
-            chatHistory.appendChild(userDiv);
-            chatHistory.scrollTop = chatHistory.scrollHeight;
-
-            chatMessages.push({ role: 'user', content: query });
-
-            // Render AI Loading
-            const aiDiv = document.createElement('div');
-            aiDiv.style.alignSelf = 'flex-start';
-            aiDiv.style.background = 'rgba(255, 255, 255, 0.05)';
-            aiDiv.style.padding = '10px 15px';
-            aiDiv.style.borderRadius = '12px 12px 12px 0';
-            aiDiv.style.maxWidth = '80%';
-            aiDiv.style.marginBottom = '8px';
-            aiDiv.innerHTML = '<strong>Gemini:</strong><br><span style="color: var(--text-muted);">Đang suy nghĩ...</span>';
-            chatHistory.appendChild(aiDiv);
-            chatHistory.scrollTop = chatHistory.scrollHeight;
-
-            try {
-                const systemPrompt = 'Bạn là Trợ lý AI đặc biệt được tích hợp trong Dashboard của Antigravity DNS Proxy, phát triển dựa trên dự án gemini-web-to-api. Bạn có nhiệm vụ giải đáp thắc mắc về hệ thống DNS, mạng di động, và hướng dẫn vận hành DNS Server này cho người dùng.';
-                const payload = [
-                    { role: 'system', content: systemPrompt },
-                    ...chatMessages
-                ];
-                const reply = await queryGemini(payload);
-                
-                aiDiv.innerHTML = '<strong>Gemini:</strong><br>' + formatMarkdown(reply);
-                chatMessages.push({ role: 'assistant', content: reply });
-            } catch (err) {
-                aiDiv.innerHTML = '<strong>Gemini:</strong><br><span style="color: #ff453a;">Lỗi kết nối bộ não AI: ' + escapeHtml(err.message) + '</span>';
-            }
-            chatHistory.scrollTop = chatHistory.scrollHeight;
-        }
-
-        async function analyzeNetwork() {
-            const resultBox = document.getElementById('ai-analysis-result');
-            resultBox.style.display = 'block';
-            resultBox.innerHTML = '<span style="color: var(--text-muted);">Đang tải dữ liệu mạng và phân tích với Gemini AI...</span>';
-
-            try {
-                const res = await fetch('/api/stats');
-                const stats = await res.json();
-                
-                let upstreamsStr = '';
-                for (let i = 0; i < stats.upstreams.length; i++) {
-                    const dns = stats.upstreams[i];
-                    upstreamsStr += '- ' + dns.name + ' (' + dns.ip + '): Ping ' + dns.avgLatency + 'ms, Trễ thực EMA ' + dns.realAvgLatency + 'ms, Đã chia ' + dns.routedQueries + ' truy vấn, Trạng thái: ' + dns.status + '\\n';
-                }
-
-                const prompt = 'Hãy đóng vai trò là Chuyên gia Tối ưu hóa Mạng. Phân tích các thông số hoạt động của máy chủ DNS sau đây để cung cấp một báo cáo sức khỏe ngắn gọn và gợi ý cấu hình tốt nhất bằng Tiếng Việt.\\n\\n' +
-                    'Thông số hệ thống:\\n' +
-                    '- Tổng số truy vấn: ' + stats.totalQueries + '\\n' +
-                    '- Tỷ lệ Cache Hit: ' + (stats.totalQueries > 0 ? Math.round((stats.cacheHits / stats.totalQueries) * 100) : 0) + '%\\n' +
-                    '- Số lần SWR ngầm: ' + stats.swrHits + '\\n' +
-                    '- Độ trễ trung bình: ' + Math.round(stats.averageLatency) + 'ms\\n' +
-                    '- Kích thước cache hiện tại: ' + stats.cacheSize + ' bản ghi\\n' +
-                    '- Uptime hoạt động: ' + Math.round(stats.uptime) + ' giây\\n' +
-                    '- Trạng thái 10 Upstream DNS:\\n' + upstreamsStr + '\\n' +
-                    'Yêu cầu báo cáo gồm:\\n' +
-                    '1. Đánh giá trạng thái tổng quan (Ví dụ: Tốt/Có nguy cơ/Chậm).\\n' +
-                    '2. Phân tích các DNS Upstream nổi bật (nhà mạng nào nhanh, nhà mạng nào có lỗi).\\n' +
-                    '3. Đề xuất hành động (ví dụ: cần làm gì trên thiết bị iOS/Android hoặc cài đặt lại vùng mạng).';
-
-                const reply = await queryGemini([{ role: 'user', content: prompt }]);
-                resultBox.innerHTML = '<strong>Báo cáo Phân tích từ Gemini AI:</strong><br>' + formatMarkdown(reply);
-            } catch (err) {
-                resultBox.innerHTML = '<span style="color: #ff453a;">Lỗi phân tích: ' + escapeHtml(err.message) + '</span><br><p style="font-size: 0.85rem; color: var(--text-muted); margin-top: 10px;">Lưu ý: Hãy chắc chắn dự án gemini-web-to-api đang chạy tại địa chỉ cấu hình và cookie đăng nhập đã chính xác.</p>';
-            }
-        }
-
         function escapeHtml(str) {
             return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
-        }
-
-        function formatMarkdown(text) {
-            return text
-                .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
-                .replace(/\\*(.*?)\\*/g, '<em>$1</em>')
-                .replace(new RegExp('\\\\x60([^\\\\x60]+)\\\\x60', 'g'), '<code style="background: rgba(255,255,255,0.1); padding: 2px 4px; border-radius: 4px;">$1</code>')
-                .replace(/\\n/g, '<br>')
-                .replace(/^- (.*)$/gm, '• $1');
         }
 
         fetchStats();
