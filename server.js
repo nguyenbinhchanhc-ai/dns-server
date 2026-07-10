@@ -753,11 +753,11 @@ const server = http.createServer(async (req, res) => {
                 <true/>
             </dict>
             <key>PayloadDescription</key>
-            <string>Cấu hình DNS over HTTPS tăng tốc độ truy cập Internet thông qua Antigravity DoH Proxy.</string>
+            <string>Antigravity Encrypted DNS over HTTPS Profile</string>
             <key>PayloadDisplayName</key>
-            <string>Antigravity DNS Accelerator</string>
+            <string>Antigravity DNS</string>
             <key>PayloadIdentifier</key>
-            <string>com.antigravity.dns.doh</string>
+            <string>com.apple.dnsSettings.managed.${uuid1}</string>
             <key>PayloadOrganization</key>
             <string>Antigravity</string>
             <key>PayloadType</key>
@@ -769,15 +769,13 @@ const server = http.createServer(async (req, res) => {
         </dict>
     </array>
     <key>PayloadDescription</key>
-    <string>Cấu hình mã hóa DNS over HTTPS hỗ trợ tăng tốc độ và bảo mật mạng di động/WiFi.</string>
+    <string>Antigravity Encrypted DNS over HTTPS Profile</string>
     <key>PayloadDisplayName</key>
-    <string>Antigravity DNS Accelerator</string>
+    <string>Antigravity DNS</string>
     <key>PayloadIdentifier</key>
-    <string>com.antigravity.dns</string>
+    <string>com.antigravity.dns.profile</string>
     <key>PayloadOrganization</key>
     <string>Antigravity</string>
-    <key>PayloadRemovalDisallowed</key>
-    <false/>
     <key>PayloadType</key>
     <string>Configuration</string>
     <key>PayloadUUID</key>
