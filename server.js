@@ -1421,6 +1421,10 @@ const server = http.createServer(async (req, res) => {
                         '</td>';
                     tableBody.appendChild(row);
                 });
+            } catch (err) {
+                console.error('Error loading stats:', err);
+            }
+        }
 
         function escapeHtml(str) {
             return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
