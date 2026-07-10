@@ -47,8 +47,21 @@ const upstreamStates = UPSTREAMS.map(dns => ({
   jitter: 0,              // Standard deviation of ping latencies
   score: 120,             // Score = avgLatency + lossRate*5 + penalty
   routedQueries: 0,       // Total client queries won by this upstream
-  status: 'Healthy'
+  status: 'Healthy',
+
+  // Enterprise Load Balancing Additions
+  activeQueries: 0,       // Concurrent outstanding queries
+  consecutiveErrors: 0,   // For Circuit Breaker
+  recoveryTime: null      // For Slow Start warmup
 }));
+
+// Unified Score Calculator
+function calculateScore(state) {
+  const jitterPenalty = state.jitter > 15 ? state.jitter * 2 : 0;
+  const concurrencyPenalty = (state.activeQueries || 0) * 15; // 15ms penalty per outstanding query
+  state.score = state.avgLatency + (state.lossRate * 5) + state.penalty + jitterPenalty + concurrencyPenalty;
+  return state.score;
+}
 
 // Pre-sorted active candidates & dynamic pool size
 let activeCandidates = [];
@@ -102,16 +115,27 @@ function getJitter(samples) {
   return Math.round(Math.sqrt(variance));
 }
 
-// Dynamic Latency-Sensitive Weighting: Selects best upstream based on scores (RTT + Loss + Penalty + Jitter)
+// Dynamic Latency-Sensitive Weighting: Selects best upstream based on scores (RTT + Loss + Penalty + Jitter + Concurrency)
 function selectWeightedUpstream(candidates) {
   if (!candidates || candidates.length === 0) return null;
   if (candidates.length === 1) return candidates[0];
 
+  const now = Date.now();
   const weights = candidates.map(c => {
-    const scoreVal = Math.max(1, c.score);
+    const scoreVal = Math.max(1, calculateScore(c));
+    // Slow Start Warmup: If recovered recently, scale down its weight gradually over 30s
+    let warmupFactor = 1.0;
+    if (c.recoveryTime) {
+      const timeDiff = now - c.recoveryTime;
+      if (timeDiff < 30000) {
+        warmupFactor = Math.max(0.1, timeDiff / 30000);
+      } else {
+        c.recoveryTime = null; // Warmup complete
+      }
+    }
     return {
       candidate: c,
-      value: Math.pow(1000 / scoreVal, 1.5) // Exponent 1.5 to favor faster and more stable upstreams while keeping load shared
+      value: Math.pow(1000 / scoreVal, 1.5) * warmupFactor
     };
   });
 
@@ -271,14 +295,23 @@ async function performHealthChecks() {
 
     state.penalty = Math.max(0, Math.round(state.penalty * 0.5));
 
-    state.score = state.avgLatency + (state.lossRate * 5) + state.penalty + jitterPenalty;
+    calculateScore(state);
 
+    const oldStatus = state.status;
     if (state.lossRate >= 60) {
       state.status = 'Offline';
     } else if (state.lossRate >= 20 || state.avgLatency > 250 || state.penalty > 200) {
       state.status = 'Warning';
+      if (oldStatus === 'Offline') {
+        state.recoveryTime = Date.now();
+        state.consecutiveErrors = 0;
+      }
     } else {
       state.status = 'Healthy';
+      if (oldStatus === 'Offline') {
+        state.recoveryTime = Date.now();
+        state.consecutiveErrors = 0;
+      }
     }
   }));
 
@@ -294,10 +327,15 @@ setInterval(updateCandidates, 5000); // Update rankings every 5s to keep CPU low
 // Perform DNS routing using Dynamic Weighted Load Balancing + Speculative Backup Retry (Dynamic delay)
 function raceDNS(queryBuffer, timeoutMs = 1200) {
   return new Promise((resolve, reject) => {
-    const candidates = activeCandidates;
-    if (candidates.length === 0) {
-      reject(new Error('No active DNS candidates'));
-      return;
+    let candidates = activeCandidates;
+    const allOffline = candidates.length === 0 || candidates.every(c => c.status === 'Offline');
+    
+    if (allOffline) {
+      // Fail-Open: Fallback to standard public DNS upstreams directly to avoid outage
+      candidates = [
+        { ip: '1.1.1.1', name: 'Cloudflare Fallback', score: 50, avgLatency: 50, activeQueries: 0, consecutiveErrors: 0, jitter: 0, lossRate: 0, penalty: 0 },
+        { ip: '8.8.8.8', name: 'Google Fallback', score: 50, avgLatency: 50, activeQueries: 0, consecutiveErrors: 0, jitter: 0, lossRate: 0, penalty: 0 }
+      ];
     }
 
     const sock = getSocketFromPool(); // Pick a socket from pool for this query
@@ -308,23 +346,57 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
     upstreamQuery.writeUInt16BE(myTxId, 0);
 
     const startTime = Date.now();
-
-    // Select primary dynamically by weights
     const primary = selectWeightedUpstream(candidates);
+    
+    const queriedStates = new Set();
+    primary.activeQueries = (primary.activeQueries || 0) + 1;
+    queriedStates.add(primary);
+
     let backupStarted = false;
     let backupTimer = null;
+
+    const decrementActiveQueries = () => {
+      for (const state of queriedStates) {
+        state.activeQueries = Math.max(0, state.activeQueries - 1);
+      }
+      queriedStates.clear();
+    };
+
+    const handleFailure = (state, penaltyAmount) => {
+      state.realErrorsCount = (state.realErrorsCount || 0) + 1;
+      state.penalty = Math.min(1000, (state.penalty || 0) + penaltyAmount);
+      state.consecutiveErrors = (state.consecutiveErrors || 0) + 1;
+      
+      if (state.consecutiveErrors >= 5 && state.status !== 'Offline' && state.status !== undefined) {
+        state.status = 'Offline';
+        // Circuit Breaker Fast-Recheck after 3s
+        setTimeout(() => {
+          pingUpstream(state.ip).then(res => {
+            if (res.success) {
+              state.consecutiveErrors = 0;
+              state.status = 'Healthy';
+              state.recoveryTime = Date.now();
+              updateCandidates();
+            }
+          });
+        }, 3000);
+      }
+      calculateScore(state);
+    };
+
+    const handleSuccess = (state) => {
+      state.consecutiveErrors = 0;
+      state.penalty = Math.max(0, (state.penalty || 0) - 25);
+      calculateScore(state);
+    };
 
     const timeout = setTimeout(() => {
       pendingQueries.delete(myTxId);
       if (backupTimer) clearTimeout(backupTimer);
+      decrementActiveQueries();
 
       const queried = backupStarted ? candidates : [primary];
-      queried.forEach(state => {
-        state.realErrorsCount++;
-        state.penalty = Math.min(1000, state.penalty + 250);
-        const jitterPenalty = state.jitter > 15 ? state.jitter * 2 : 0;
-        state.score = state.avgLatency + (state.lossRate * 5) + state.penalty + jitterPenalty;
-      });
+      queried.forEach(state => handleFailure(state, 250));
 
       reject(new Error('DNS query timeout'));
     }, timeoutMs);
@@ -333,24 +405,22 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
       resolve: ({ buffer, from }) => {
         clearTimeout(timeout);
         if (backupTimer) clearTimeout(backupTimer);
-        const latency = Date.now() - startTime;
+        decrementActiveQueries();
         
         const responseBuffer = Buffer.from(buffer);
         responseBuffer.writeUInt16BE(originalTxId, 0);
         
-        const winner = upstreamStates.find(s => s.ip === from);
+        const winner = upstreamStates.find(s => s.ip === from) || candidates.find(c => c.ip === from);
         if (winner) {
-          winner.routedQueries++;
-          
+          winner.routedQueries = (winner.routedQueries || 0) + 1;
+          const latency = Date.now() - startTime;
           const alpha = 0.3;
-          winner.realAvgLatency = winner.realQueriesCount === 0 
+          winner.realAvgLatency = (winner.realQueriesCount || 0) === 0 
             ? latency 
-            : Math.round(alpha * latency + (1 - alpha) * winner.realAvgLatency);
-          winner.realQueriesCount++;
+            : Math.round(alpha * latency + (1 - alpha) * (winner.realAvgLatency || latency));
+          winner.realQueriesCount = (winner.realQueriesCount || 0) + 1;
           
-          winner.penalty = Math.max(0, winner.penalty - 25);
-          const jitterPenalty = winner.jitter > 15 ? winner.jitter * 2 : 0;
-          winner.score = winner.avgLatency + (winner.lossRate * 5) + winner.penalty + jitterPenalty;
+          handleSuccess(winner);
         }
 
         resolve({ responseBuffer, from });
@@ -359,14 +429,10 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
         clearTimeout(timeout);
         if (backupTimer) clearTimeout(backupTimer);
         pendingQueries.delete(myTxId);
+        decrementActiveQueries();
         
         const queried = backupStarted ? candidates : [primary];
-        queried.forEach(state => {
-          state.realErrorsCount++;
-          state.penalty = Math.min(1000, state.penalty + 200);
-          const jitterPenalty = state.jitter > 15 ? state.jitter * 2 : 0;
-          state.score = state.avgLatency + (state.lossRate * 5) + state.penalty + jitterPenalty;
-        });
+        queried.forEach(state => handleFailure(state, 200));
 
         reject(err);
       },
@@ -396,11 +462,14 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
       let sentCount = 0;
       for (const state of candidates) {
         if (state.ip !== primary.ip && sentCount < 2) {
+          state.activeQueries = (state.activeQueries || 0) + 1;
+          queriedStates.add(state);
+
           sock.send(upstreamQuery, 0, upstreamQuery.length, 53, state.ip, (err) => {
             if (err) {
-              state.realErrorsCount++;
-              state.penalty = Math.min(1000, state.penalty + 100);
-              state.score = state.avgLatency + (state.lossRate * 5) + state.penalty;
+              state.activeQueries = Math.max(0, state.activeQueries - 1);
+              queriedStates.delete(state);
+              handleFailure(state, 100);
             }
           });
           sentCount++;
