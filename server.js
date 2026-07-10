@@ -782,8 +782,8 @@ const server = http.createServer(async (req, res) => {
 </plist>`;
 
     res.writeHead(200, {
-      'Content-Type': 'application/x-apple-aspen-config',
-      'Content-Disposition': 'attachment; filename=antigravity-dns.mobileconfig'
+      'Content-Type': 'application/x-apple-aspen-config; charset=utf-8',
+      'Content-Disposition': 'inline; filename="antigravity-dns.mobileconfig"'
     });
     res.end(configXml);
     return;
@@ -1264,6 +1264,9 @@ const server = http.createServer(async (req, res) => {
                     <div class="device-content">
                         <p>Nhấp vào nút bên dưới để tải và cài đặt profile hệ thống:</p>
                         <a href="/download-profile" class="btn-download">Tải Profile Cấu Hình (.mobileconfig)</a>
+                        <p style="margin-top: 12px; font-size: 0.85rem; color: #ff9f0a; font-weight: 600; line-height: 1.4;">
+                            ⚠️ QUAN TRỌNG: Bạn BẮT BUỘC phải mở trang này bằng trình duyệt Safari thì iOS mới hiển thị trình cài đặt Profile. Nếu đang mở trong Zalo, Facebook, Messenger hoặc Chrome, hãy sao chép liên kết trang này và dán vào Safari.
+                        </p>
                         <p style="margin-top: 15px; font-size: 0.9rem; color: var(--text-muted);">
                             <strong>Tính năng bảo mật nâng cao:</strong><br>
                             • <strong>Ép buộc điều tuyến (Prohibit Fallback)</strong>: Gom và buộc 100% truy vấn DNS đi qua máy chủ DoH, ngăn chặn việc rò rỉ (leak) ra DNS mặc định của Wi-Fi hay nhà mạng di động.<br>
