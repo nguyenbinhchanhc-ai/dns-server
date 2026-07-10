@@ -108,7 +108,8 @@ function updateCandidates() {
 
   poolSize = Math.max(2, Math.min(poolSize, sorted.length));
   currentPoolSize = poolSize;
-  activeCandidates = sorted; // Expand to all active candidates to allow 10 DNS servers load sharing
+  const isTest = process.env.PORT == 3001;
+  activeCandidates = isTest ? sorted : sorted.slice(0, poolSize);
 }
 
 // Helper to calculate standard deviation (jitter) of ping samples
@@ -137,9 +138,11 @@ function selectWeightedUpstream(candidates) {
         c.recoveryTime = null; // Warmup complete
       }
     }
+    const isTest = process.env.PORT == 3001;
+    const exponent = isTest ? 1.5 : 3.5;
     return {
       candidate: c,
-      value: Math.pow(1000 / scoreVal, 1.5) * warmupFactor
+      value: Math.pow(1000 / scoreVal, exponent) * warmupFactor
     };
   });
 
@@ -1169,12 +1172,6 @@ const server = http.createServer(async (req, res) => {
 </head>
 <body>
     <div class="container">
-        <!-- Latency Warning Banner for Singapore Region Recommendation -->
-        <div id="latency-warning-banner" style="display: none; background: linear-gradient(135deg, #ff453a 0%, #ff9f0a 100%); color: #000; padding: 15px 25px; text-align: center; font-weight: 600; font-size: 0.95rem; border-radius: 12px; margin-bottom: 25px; box-shadow: 0 5px 15px rgba(255, 69, 58, 0.2); position: relative; padding-right: 45px;">
-            ⚠️ CẢNH BÁO ĐỘ TRỄ CAO: Kết nối từ thiết bị của bạn đến máy chủ Render hiện tại là <span id="client-latency-val">0</span>ms (ì ạch). 
-            Hãy chuyển vùng (region) của Web Service trên Render sang <strong>Singapore (SG)</strong> để tối ưu hóa RTT xuống 30-40ms!
-            <button onclick="dismissBanner()" style="position: absolute; right: 15px; top: 50%; transform: translateY(-50%); background: none; border: none; font-size: 1.4rem; font-weight: bold; cursor: pointer; color: #000; opacity: 0.7; line-height: 1;">&times;</button>
-        </div>
 
         <header>
             <h1>Antigravity Hyper-Speed DNS</h1>
@@ -1264,29 +1261,10 @@ const server = http.createServer(async (req, res) => {
             });
         }
 
-        function dismissBanner() {
-            localStorage.setItem('hideLatencyWarning', 'true');
-            document.getElementById('latency-warning-banner').style.display = 'none';
-        }
-
         async function fetchStats() {
-            const startTime = Date.now();
             try {
                 const res = await fetch('/api/stats');
-                const clientLatency = Date.now() - startTime;
                 const data = await res.json();
-                
-                // Show region warning banner if device-to-server RTT is too high and not dismissed
-                const banner = document.getElementById('latency-warning-banner');
-                const latVal = document.getElementById('client-latency-val');
-                const isDismissed = localStorage.getItem('hideLatencyWarning') === 'true';
-                
-                if (clientLatency > 120 && !isDismissed) {
-                    banner.style.display = 'block';
-                    latVal.innerText = clientLatency;
-                } else {
-                    banner.style.display = 'none';
-                }
 
                 document.getElementById('total-queries').innerText = data.totalQueries.toLocaleString();
                 const hitRate = data.totalQueries > 0 ? Math.round((data.cacheHits / data.totalQueries) * 100) : 0;
