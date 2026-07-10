@@ -536,7 +536,87 @@ setInterval(() => {
   }
 }, 120000);
 
+// Predictive DNS Prefetching Engine
+const DOMAIN_ASSOCIATIONS = {
+  'facebook.com': ['static.xx.fbcdn.net', 'edge-chat.facebook.com', 'connect.facebook.net', 'scontent.fhan14-1.fna.fbcdn.net'],
+  'youtube.com': ['googlevideo.com', 'yt3.ggpht.com', 'i.ytimg.com'],
+  'google.com': ['fonts.gstatic.com', 'apis.google.com', 'ssl.gstatic.com', 'www.gstatic.com'],
+  'shopee.vn': ['cf.shopee.vn', 'seo-api.shopee.vn', 'down-vn.img.susercontent.com'],
+  'tiki.vn': ['salt.tikicdn.com'],
+  'vnexpress.net': ['s1.vnecdn.net', 's.vnecdn.net']
+};
 
+const queryFrequency = new Map();
+
+function prefetchDomain(name, type = 'A') {
+  const cacheKey = `${name.toLowerCase()}:${type}:IN`;
+  if (cache.has(cacheKey)) {
+    const entry = cache.get(cacheKey);
+    const ageSec = (Date.now() - entry.cachedAt) / 1000;
+    if (ageSec < entry.originalTtl * 0.7) {
+      return; // Still fresh, skip prefetch
+    }
+  }
+
+  const txId = getNextTxId();
+  const packet = dnsPacket.encode({
+    type: 'query',
+    id: txId,
+    flags: dnsPacket.RECURSION_DESIRED,
+    questions: [{ type, name }]
+  });
+
+  raceDNS(packet, 1200).then(({ responseBuffer }) => {
+    try {
+      const dnsRes = dnsPacket.decode(responseBuffer);
+      if (dnsRes.answers && dnsRes.answers.length > 0) {
+        const minTtl = getMinTTL(dnsRes);
+        const key = getCacheKey(dnsRes);
+        if (key) {
+          cache.set(key, {
+            buffer: responseBuffer,
+            cachedAt: Date.now(),
+            originalTtl: minTtl,
+            expiresAt: Date.now() + minTtl * 1000
+          });
+        }
+      }
+    } catch (e) {
+      // Ignore background errors
+    }
+  }).catch(() => {});
+}
+
+function predictAndPrefetch(domainName) {
+  if (!domainName) return;
+  const cleanDomain = domainName.toLowerCase();
+  
+  // Track frequency
+  const currentCount = queryFrequency.get(cleanDomain) || 0;
+  queryFrequency.set(cleanDomain, currentCount + 1);
+
+  // Prefetch associated domains in parallel asynchronously
+  for (const [key, subdomains] of Object.entries(DOMAIN_ASSOCIATIONS)) {
+    if (cleanDomain.includes(key)) {
+      subdomains.forEach(sub => {
+        setImmediate(() => prefetchDomain(sub));
+      });
+      break;
+    }
+  }
+}
+
+// Active Hot Cache Prefetcher: Scan top 15 domains and proactively refresh them before TTL expires
+setInterval(() => {
+  if (queryFrequency.size === 0) return;
+  const sorted = [...queryFrequency.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 15);
+    
+  sorted.forEach(([domain]) => {
+    prefetchDomain(domain);
+  });
+}, 45000); // Check and refresh hot domains every 45 seconds
 
 function isValidPublicIp(ip) {
   if (!ip) return false;
@@ -604,6 +684,10 @@ async function handleDoH(queryBuffer, clientIp) {
     } catch (e) {
       // Catch silently to avoid crash on malformed query buffers
     }
+  }
+
+  if (dnsQueryObj.questions && dnsQueryObj.questions.length > 0) {
+    predictAndPrefetch(dnsQueryObj.questions[0].name);
   }
 
   const cacheKey = getCacheKey(dnsQueryObj);
