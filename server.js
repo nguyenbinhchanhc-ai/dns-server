@@ -15,7 +15,11 @@ const UPSTREAMS = [
   { ip: '208.67.222.222', name: 'OpenDNS Home' },
   { ip: '208.67.220.220', name: 'OpenDNS Custom' },
   { ip: '94.140.14.14', name: 'AdGuard Default' },
-  { ip: '76.76.2.0', name: 'ControlD Unfiltered' }
+  { ip: '76.76.2.0', name: 'ControlD Unfiltered' },
+  
+  // Vietnam National DNS (Open Resolvers)
+  { ip: '203.119.36.106', name: 'VNNIC Primary' },
+  { ip: '203.119.38.106', name: 'VNNIC Secondary' }
 ];
 
 // Stats Registry
@@ -240,7 +244,7 @@ function pingUpstream(ip) {
     const timeout = setTimeout(() => {
       pendingQueries.delete(txId);
       resolve({ success: false, latency: 1000 });
-    }, 1500);
+    }, 600);
 
     pendingQueries.set(txId, {
       resolve: () => {
