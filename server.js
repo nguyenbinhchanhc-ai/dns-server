@@ -448,14 +448,7 @@ function base64urlDecode(str) {
   return Buffer.from(base64, 'base64');
 }
 
-// Dynamic UUID Generator for iOS Profiles
-function generateUUID() {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = Math.random() * 16 | 0;
-    const v = c === 'x' ? r : (r & 0x3 | 0x8);
-    return v.toString(16);
-  }).toUpperCase();
-}
+
 
 // Periodic cleanup of expired cache entries (every 2 minutes)
 setInterval(() => {
@@ -731,67 +724,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Endpoint 3: iOS Profile Downloader
-  if (parsedUrl.pathname === '/download-profile') {
-    const host = req.headers.host || 'localhost';
-    const uuid1 = generateUUID();
-    const uuid2 = generateUUID();
-    const configXml = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>PayloadContent</key>
-    <array>
-        <dict>
-            <key>DNSSettings</key>
-            <dict>
-                <key>DNSProtocol</key>
-                <string>HTTPS</string>
-                <key>ServerURL</key>
-                <string>https://${host}/dns-query</string>
-                <key>ProhibitFallback</key>
-                <true/>
-            </dict>
-            <key>PayloadDescription</key>
-            <string>Antigravity Encrypted DNS over HTTPS Profile</string>
-            <key>PayloadDisplayName</key>
-            <string>Antigravity DNS</string>
-            <key>PayloadIdentifier</key>
-            <string>com.apple.dnsSettings.managed.${uuid1}</string>
-            <key>PayloadOrganization</key>
-            <string>Antigravity</string>
-            <key>PayloadType</key>
-            <string>com.apple.dnsSettings.managed</string>
-            <key>PayloadUUID</key>
-            <string>${uuid1}</string>
-            <key>PayloadVersion</key>
-            <integer>1</integer>
-        </dict>
-    </array>
-    <key>PayloadDescription</key>
-    <string>Antigravity Encrypted DNS over HTTPS Profile</string>
-    <key>PayloadDisplayName</key>
-    <string>Antigravity DNS</string>
-    <key>PayloadIdentifier</key>
-    <string>com.antigravity.dns.profile</string>
-    <key>PayloadOrganization</key>
-    <string>Antigravity</string>
-    <key>PayloadType</key>
-    <string>Configuration</string>
-    <key>PayloadUUID</key>
-    <string>${uuid2}</string>
-    <key>PayloadVersion</key>
-    <integer>1</integer>
-</dict>
-</plist>`;
 
-    res.writeHead(200, {
-      'Content-Type': 'application/x-apple-aspen-config; charset=utf-8',
-      'Content-Disposition': 'inline; filename="antigravity-dns.mobileconfig"'
-    });
-    res.end(configXml);
-    return;
-  }
 
   // Endpoint 4: Premium Web Dashboard UI
   if (parsedUrl.pathname === '/') {
@@ -978,78 +911,7 @@ const server = http.createServer(async (req, res) => {
             font-weight: 600;
         }
 
-        .device-accordion {
-            border: 1px solid var(--border-color);
-            border-radius: 14px;
-            overflow: hidden;
-            margin-bottom: 12px;
-            background: rgba(255, 255, 255, 0.01);
-            transition: all 0.3s;
-        }
 
-        .device-header {
-            padding: 16px 22px;
-            cursor: pointer;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-weight: 600;
-            user-select: none;
-        }
-
-        .device-header:hover {
-            background: rgba(255, 255, 255, 0.03);
-        }
-
-        .device-content {
-            padding: 22px;
-            background: rgba(0, 0, 0, 0.18);
-            border-top: 1px solid var(--border-color);
-            display: none;
-            line-height: 1.6;
-        }
-
-        .device-content ol {
-            padding-left: 20px;
-        }
-
-        .device-content li {
-            margin-bottom: 8px;
-        }
-
-        .device-accordion.active .device-content {
-            display: block;
-        }
-
-        .device-accordion.active .arrow {
-            transform: rotate(180deg);
-        }
-
-        .arrow {
-            transition: transform 0.3s;
-            display: inline-block;
-            border: solid var(--text-muted);
-            border-width: 0 2px 2px 0;
-            padding: 3px;
-            transform: rotate(45deg);
-        }
-
-        .btn-download {
-            display: inline-block;
-            background: var(--accent-glow);
-            color: #000;
-            text-decoration: none;
-            padding: 9px 18px;
-            border-radius: 8px;
-            font-weight: 600;
-            margin-top: 12px;
-            transition: all 0.2s;
-        }
-
-        .btn-download:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(0, 247, 255, 0.25);
-        }
 
         .table-container {
             width: 100%;
@@ -1258,47 +1120,6 @@ const server = http.createServer(async (req, res) => {
                 <button class="btn-copy" onclick="copyUrl()">Sao chép</button>
             </div>
 
-            <h2>Cấu hình thiết bị</h2>
-            <div class="setup-steps">
-                <div class="device-accordion">
-                    <div class="device-header" onclick="toggleAccordion(this)">
-                        <span>Apple iOS / macOS (Tải profile hệ thống tự động)</span>
-                        <span class="arrow"></span>
-                    </div>
-                    <div class="device-content">
-                        <p>Nhấp vào nút bên dưới để tải và cài đặt profile hệ thống:</p>
-                        <a href="/download-profile" class="btn-download">Tải Profile Cấu Hình (.mobileconfig)</a>
-                        <p style="margin-top: 12px; font-size: 0.85rem; color: #ff9f0a; font-weight: 600; line-height: 1.4;">
-                            ⚠️ QUAN TRỌNG: Bạn BẮT BUỘC phải mở trang này bằng trình duyệt Safari thì iOS mới hiển thị trình cài đặt Profile. Nếu đang mở trong Zalo, Facebook, Messenger hoặc Chrome, hãy sao chép liên kết trang này và dán vào Safari.
-                        </p>
-                        <p style="margin-top: 15px; font-size: 0.9rem; color: var(--text-muted);">
-                            <strong>Tính năng bảo mật nâng cao:</strong><br>
-                            • <strong>Ép buộc điều tuyến (Prohibit Fallback)</strong>: Gom và buộc 100% truy vấn DNS đi qua máy chủ DoH, ngăn chặn việc rò rỉ (leak) ra DNS mặc định của Wi-Fi hay nhà mạng di động.<br>
-                            • <strong>Tối ưu chuyển mạng (Bootstrap DNS)</strong>: Khai báo sẵn các IP định danh (1.1.1.1, 8.8.8.8) giúp thiết bị iOS kết nối ngay lập tức và duy trì độ trễ cực thấp khi di chuyển giữa Wi-Fi và mạng di động 4G/5G.
-                        </p>
-                    </div>
-                </div>
-
-                <div class="device-accordion">
-                    <div class="device-header" onclick="toggleAccordion(this)">
-                        <span>Google Android (Thông qua Intra/Nebulo)</span>
-                        <span class="arrow"></span>
-                    </div>
-                    <div class="device-content">
-                        <p>Sử dụng app **Intra** hoặc **Nebulo** trên Android, thêm Custom URL và dán đường link DoH phía trên của bạn vào.</p>
-                    </div>
-                </div>
-
-                <div class="device-accordion">
-                    <div class="device-header" onclick="toggleAccordion(this)">
-                        <span>Trình duyệt (Chrome / Firefox / Edge)</span>
-                        <span class="arrow"></span>
-                    </div>
-                    <div class="device-content">
-                        <p>Mở mục Cài đặt DNS an toàn trên trình duyệt của bạn (Chrome: Bảo mật -> Sử dụng DNS an toàn -> Tùy chỉnh; Firefox: Quyền riêng tư -> DNS qua HTTPS -> Max -> Tùy chỉnh) và dán link DoH vào.</p>
-                    </div>
-                </div>
-            </div>
         </div>
 
 
@@ -1309,9 +1130,7 @@ const server = http.createServer(async (req, res) => {
     </div>
 
     <script>
-        function toggleAccordion(el) {
-            el.parentElement.classList.toggle('active');
-        }
+
 
         function copyUrl() {
             const urlText = document.getElementById('doh-url').innerText;
