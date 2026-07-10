@@ -793,6 +793,47 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Endpoint 2.5: Vietnam DNS Scanner
+  if (parsedUrl.pathname === '/api/test-dns') {
+    const ipsToTest = [
+      { ip: '203.113.131.1', name: 'Viettel Primary' },
+      { ip: '203.113.131.2', name: 'Viettel Secondary' },
+      { ip: '203.113.181.1', name: 'Viettel Backup' },
+      { ip: '203.162.4.191', name: 'VNPT Primary' },
+      { ip: '203.162.4.190', name: 'VNPT Secondary' },
+      { ip: '203.162.0.181', name: 'VNPT Backup 1' },
+      { ip: '203.162.0.11', name: 'VNPT Backup 2' },
+      { ip: '210.245.14.4', name: 'FPT Primary' },
+      { ip: '210.245.0.14', name: 'FPT Secondary' },
+      { ip: '210.245.0.131', name: 'FPT Backup 1' },
+      { ip: '210.245.24.20', name: 'FPT Backup 2' },
+      { ip: '210.245.24.22', name: 'FPT Backup 3' },
+      { ip: '203.162.57.105', name: 'VNNIC Primary' },
+      { ip: '203.162.57.107', name: 'VNNIC Secondary' },
+      { ip: '203.119.36.1', name: 'VNNIC Backup 1' },
+      { ip: '203.119.38.1', name: 'VNNIC Backup 2' },
+      { ip: '203.119.36.106', name: 'VNNIC Public 1' },
+      { ip: '203.119.38.106', name: 'VNNIC Public 2' },
+      { ip: '118.69.224.242', name: 'CMC Primary' },
+      { ip: '118.69.224.243', name: 'CMC Secondary' }
+    ];
+
+    const results = [];
+    await Promise.all(ipsToTest.map(async (dns) => {
+      const res = await pingUpstream(dns.ip);
+      results.push({
+        ip: dns.ip,
+        name: dns.name,
+        success: res.success,
+        latency: res.success ? res.latency : null
+      });
+    }));
+
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(results, null, 2));
+    return;
+  }
+
 
 
   // Endpoint 4: Premium Web Dashboard UI
