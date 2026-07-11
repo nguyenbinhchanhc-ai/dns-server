@@ -108,8 +108,7 @@ function updateCandidates() {
 
   poolSize = Math.max(2, Math.min(poolSize, sorted.length));
   currentPoolSize = poolSize;
-  const isTest = process.env.PORT == 3001;
-  activeCandidates = isTest ? sorted : sorted.slice(0, poolSize);
+  activeCandidates = sorted; // Allow all healthy DNS servers to share load
 }
 
 // Helper to calculate standard deviation (jitter) of ping samples
@@ -138,8 +137,7 @@ function selectWeightedUpstream(candidates) {
         c.recoveryTime = null; // Warmup complete
       }
     }
-    const isTest = process.env.PORT == 3001;
-    const exponent = isTest ? 1.5 : 3.5;
+    const exponent = 1.8;
     return {
       candidate: c,
       value: Math.pow(1000 / scoreVal, exponent) * warmupFactor
