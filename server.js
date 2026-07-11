@@ -160,10 +160,32 @@ function selectWeightedUpstream(candidates) {
 // In-Memory DNS Cache (Key: name:type:class)
 const cache = new Map();
 
+function overrideTtlInResponse(buffer) {
+  try {
+    const decoded = dnsPacket.decode(buffer);
+    let changed = false;
+    if (decoded.answers) {
+      decoded.answers.forEach(ans => {
+        if (ans.ttl !== undefined && ans.ttl < 600) {
+          ans.ttl = 600; // Force 10 minutes cache TTL for clients
+          changed = true;
+        }
+      });
+    }
+    return changed ? dnsPacket.encode(decoded) : buffer;
+  } catch (e) {
+    return buffer;
+  }
+}
+
 function safeCacheSet(key, value) {
   if (cache.size >= 25000) {
     const firstKey = cache.keys().next().value;
     if (firstKey) cache.delete(firstKey);
+  }
+  // Intercept buffer to apply TTL boost for client responses
+  if (value && value.buffer) {
+    value.buffer = overrideTtlInResponse(value.buffer);
   }
   cache.set(key, value);
 }
@@ -363,10 +385,16 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
 
     const startTime = Date.now();
     const primary = selectWeightedUpstream(candidates);
+    const secondaryCandidates = candidates.filter(c => c.ip !== primary.ip);
+    const secondary = secondaryCandidates.length > 0 ? selectWeightedUpstream(secondaryCandidates) : null;
     
     const queriedStates = new Set();
     primary.activeQueries = (primary.activeQueries || 0) + 1;
     queriedStates.add(primary);
+    if (secondary) {
+      secondary.activeQueries = (secondary.activeQueries || 0) + 1;
+      queriedStates.add(secondary);
+    }
 
     let backupStarted = false;
     let backupTimer = null;
@@ -411,7 +439,7 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
       if (backupTimer) clearTimeout(backupTimer);
       decrementActiveQueries();
 
-      const queried = backupStarted ? candidates : [primary];
+      const queried = backupStarted ? candidates : (secondary ? [primary, secondary] : [primary]);
       queried.forEach(state => handleFailure(state, 250));
 
       reject(new Error('DNS query timeout'));
@@ -447,7 +475,7 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
         pendingQueries.delete(myTxId);
         decrementActiveQueries();
         
-        const queried = backupStarted ? candidates : [primary];
+        const queried = backupStarted ? candidates : (secondary ? [primary, secondary] : [primary]);
         queried.forEach(state => handleFailure(state, 200));
 
         reject(err);
@@ -463,6 +491,15 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
       }
     });
 
+    // Send query to secondary (Racing Parallel Resolution)
+    if (secondary) {
+      sock.send(upstreamQuery, 0, upstreamQuery.length, 53, secondary.ip, (err) => {
+        if (err) {
+          // Non-fatal error
+        }
+      });
+    }
+
     // Dynamic Speculative Backup Delay: wait only 1.4x of primary's latency (min 70ms, max 250ms)
     const backupDelay = Math.max(70, Math.min(250, Math.round(primary.avgLatency * 1.4)));
     
@@ -474,10 +511,10 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
       if (backupStarted) return;
       backupStarted = true;
 
-      // Send query to the top 2 fastest backup candidates (excluding the primary)
+      // Send query to the top 2 fastest backup candidates (excluding primary & secondary)
       let sentCount = 0;
       for (const state of candidates) {
-        if (state.ip !== primary.ip && sentCount < 2) {
+        if (state.ip !== primary.ip && (!secondary || state.ip !== secondary.ip) && sentCount < 2) {
           state.activeQueries = (state.activeQueries || 0) + 1;
           queriedStates.add(state);
 
