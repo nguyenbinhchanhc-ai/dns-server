@@ -545,7 +545,7 @@ setInterval(() => {
   }
 }, 120000);
 
-// Predictive DNS Prefetching Engine
+// Predictive DNS Prefetching Engine (Self-Learning Markov Transitions & Throttled Queue)
 const DOMAIN_ASSOCIATIONS = {
   'facebook.com': ['static.xx.fbcdn.net', 'edge-chat.facebook.com', 'connect.facebook.net', 'scontent.fhan14-1.fna.fbcdn.net'],
   'youtube.com': ['googlevideo.com', 'yt3.ggpht.com', 'i.ytimg.com'],
@@ -556,14 +556,21 @@ const DOMAIN_ASSOCIATIONS = {
 };
 
 const queryFrequency = new Map();
+const lastClientQuery = new Map(); // clientIp -> { domain, time }
+const transitionMap = new Map();    // domainA -> Map of domainB -> count
 
-function prefetchDomain(name, type = 'A') {
+// Throttled Concurrency Prefetch Queue
+const prefetchQueue = [];
+let activePrefetches = 0;
+const MAX_CONCURRENT_PREFETCH = 3;
+
+function prefetchDomainDirect(name, type = 'A') {
   const cacheKey = `${name.toLowerCase()}:${type}:IN`;
   if (cache.has(cacheKey)) {
     const entry = cache.get(cacheKey);
     const ageSec = (Date.now() - entry.cachedAt) / 1000;
     if (ageSec < entry.originalTtl * 0.7) {
-      return; // Still fresh, skip prefetch
+      return Promise.resolve(); // Still fresh, skip prefetch
     }
   }
 
@@ -575,7 +582,7 @@ function prefetchDomain(name, type = 'A') {
     questions: [{ type, name }]
   });
 
-  raceDNS(packet, 1200).then(({ responseBuffer }) => {
+  return raceDNS(packet, 1200).then(({ responseBuffer }) => {
     try {
       const dnsRes = dnsPacket.decode(responseBuffer);
       if (dnsRes.answers && dnsRes.answers.length > 0) {
@@ -596,19 +603,77 @@ function prefetchDomain(name, type = 'A') {
   }).catch(() => {});
 }
 
-function predictAndPrefetch(domainName) {
+function processPrefetchQueue() {
+  if (activePrefetches >= MAX_CONCURRENT_PREFETCH || prefetchQueue.length === 0) return;
+  
+  const task = prefetchQueue.shift();
+  activePrefetches++;
+  
+  prefetchDomainDirect(task.name, task.type)
+    .finally(() => {
+      activePrefetches--;
+      processPrefetchQueue();
+    });
+}
+
+function enqueuePrefetch(name, type = 'A') {
+  const cleanName = name.toLowerCase();
+  // Prevent duplicates in queue
+  if (prefetchQueue.some(q => q.name === cleanName && q.type === type)) return;
+  
+  prefetchQueue.push({ name: cleanName, type });
+  processPrefetchQueue();
+}
+
+function predictAndPrefetch(domainName, clientIp) {
   if (!domainName) return;
   const cleanDomain = domainName.toLowerCase();
   
-  // Track frequency
+  // 1. Track frequency
   const currentCount = queryFrequency.get(cleanDomain) || 0;
   queryFrequency.set(cleanDomain, currentCount + 1);
 
-  // Prefetch associated domains in parallel asynchronously
+  // 2. Real-Time Pattern Learning (Markov-like transition learning)
+  if (clientIp) {
+    const last = lastClientQuery.get(clientIp);
+    const now = Date.now();
+    
+    if (last && (now - last.time < 3000)) { // User queried another domain within 3 seconds
+      const prev = last.domain;
+      if (prev !== cleanDomain && !cleanDomain.includes(prev) && !prev.includes(cleanDomain)) {
+        let entry = transitionMap.get(prev);
+        if (!entry) {
+          entry = new Map();
+          transitionMap.set(prev, entry);
+        }
+        entry.set(cleanDomain, (entry.get(cleanDomain) || 0) + 1);
+        
+        // Eviction to keep transitionMap size in check
+        if (transitionMap.size > 5000) {
+          const firstKey = transitionMap.keys().next().value;
+          transitionMap.delete(firstKey);
+        }
+      }
+    }
+    lastClientQuery.set(clientIp, { domain: cleanDomain, time: now });
+  }
+
+  // 3. Prefetch learned sequential transitions (top 3 candidates)
+  const learned = transitionMap.get(cleanDomain);
+  if (learned) {
+    const topLearned = [...learned.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3);
+    topLearned.forEach(([target]) => {
+      setImmediate(() => enqueuePrefetch(target));
+    });
+  }
+
+  // 4. Prefetch static associations
   for (const [key, subdomains] of Object.entries(DOMAIN_ASSOCIATIONS)) {
     if (cleanDomain.includes(key)) {
       subdomains.forEach(sub => {
-        setImmediate(() => prefetchDomain(sub));
+        setImmediate(() => enqueuePrefetch(sub));
       });
       break;
     }
@@ -623,9 +688,9 @@ setInterval(() => {
     .slice(0, 15);
     
   sorted.forEach(([domain]) => {
-    prefetchDomain(domain);
+    enqueuePrefetch(domain);
   });
-}, 45000); // Check and refresh hot domains every 45 seconds
+}, 45000); // Check and refresh hot domains every 45 seconds // Check and refresh hot domains every 45 seconds
 
 function isValidPublicIp(ip) {
   if (!ip) return false;
@@ -696,7 +761,7 @@ async function handleDoH(queryBuffer, clientIp) {
   }
 
   if (dnsQueryObj.questions && dnsQueryObj.questions.length > 0) {
-    predictAndPrefetch(dnsQueryObj.questions[0].name);
+    predictAndPrefetch(dnsQueryObj.questions[0].name, clientIp);
   }
 
   const cacheKey = getCacheKey(dnsQueryObj);
