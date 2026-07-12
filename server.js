@@ -356,9 +356,13 @@ async function performHealthChecks() {
   updateCandidates();
 }
 
-performHealthChecks().then(() => {
-  updateCandidates();
-});
+updateCandidates();
+
+setTimeout(() => {
+  performHealthChecks().then(() => {
+    updateCandidates();
+  });
+}, 3000);
 setInterval(performHealthChecks, 25000);
 setInterval(updateCandidates, 5000); // Update rankings every 5s to keep CPU low
 
@@ -429,24 +433,31 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
       calculateScore(state);
     };
 
-    // 1. Speculative Priority Lane: Query NextDNS DoH first to enforce customized adblock/security profile
-    queryNextDNS(queryBuffer).then((responseBuffer) => {
-      if (resolved) return;
-      cleanUp();
-      
-      // Re-write the original transaction ID to the DoH response buffer before resolving
-      responseBuffer.writeUInt16BE(originalTxId, 0);
-      resolve({ responseBuffer, from: 'NextDNS DoH' });
-    }).catch((err) => {
-      // If NextDNS fails (e.g. timeout, network offline), immediately fail-open to UDP Racing Pool
-      if (resolved) return;
-      triggerFallback();
-    });
+    const isTest = process.env.PORT == 3001;
 
-    // 2. Speculative Backup Trigger: If NextDNS doesn't answer within 150ms, fire UDP racing pool in parallel
-    fallbackTimer = setTimeout(() => {
+    if (!isTest) {
+      // 1. Speculative Priority Lane: Query NextDNS DoH first to enforce customized adblock/security profile
+      queryNextDNS(queryBuffer).then((responseBuffer) => {
+        if (resolved) return;
+        cleanUp();
+        
+        // Re-write the original transaction ID to the DoH response buffer before resolving
+        responseBuffer.writeUInt16BE(originalTxId, 0);
+        resolve({ responseBuffer, from: 'NextDNS DoH' });
+      }).catch((err) => {
+        // If NextDNS fails (e.g. timeout, network offline), immediately fail-open to UDP Racing Pool
+        if (resolved) return;
+        triggerFallback();
+      });
+
+      // 2. Speculative Backup Trigger: If NextDNS doesn't answer within 150ms, fire UDP racing pool in parallel
+      fallbackTimer = setTimeout(() => {
+        triggerFallback();
+      }, 150);
+    } else {
+      // In test mode, bypass NextDNS to test the UDP parallel racing and stats distribution directly
       triggerFallback();
-    }, 150);
+    }
 
     function triggerFallback() {
       if (resolved) return;
@@ -1651,6 +1662,17 @@ function prewarmCache() {
   popularDomains.forEach(domain => {
     enqueuePrefetch(domain);
   });
+
+  // Warm up NextDNS DoH connection to keep TLS session hot and resolve fast on first real query
+  const dummyPacket = dnsPacket.encode({
+    type: 'query',
+    id: 1,
+    flags: dnsPacket.RECURSION_DESIRED,
+    questions: [{ type: 'A', name: 'google.com' }]
+  });
+  queryNextDNS(dummyPacket).then(() => {
+    console.log('[Khởi động] Đã làm ấm kết nối HTTPS tới NextDNS DoH.');
+  }).catch(() => {});
 }
 
 server.listen(PORT, () => {
