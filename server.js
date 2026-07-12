@@ -366,20 +366,26 @@ setTimeout(() => {
 setInterval(performHealthChecks, 25000);
 setInterval(updateCandidates, 5000); // Update rankings every 5s to keep CPU low
 
-const NEXTDNS_DOH_URL = 'https://dns.nextdns.io/53ae9a';
+const NEXTDNS_DOH_URL = 'https://dns.nextdns.io/53ae9a/RenderProxy';
 
-async function queryNextDNS(queryBuffer) {
+async function queryNextDNS(queryBuffer, clientIp) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 1200);
+  
+  const headers = {
+    'Content-Type': 'application/dns-message',
+    'Accept': 'application/dns-message',
+    'Cache-Control': 'no-cache'
+  };
+  
+  if (clientIp && isValidPublicIp(clientIp)) {
+    headers['X-Forwarded-For'] = clientIp;
+  }
   
   try {
     const res = await fetch(NEXTDNS_DOH_URL, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/dns-message',
-        'Accept': 'application/dns-message',
-        'Cache-Control': 'no-cache'
-      },
+      headers: headers,
       body: queryBuffer,
       signal: controller.signal
     });
@@ -395,7 +401,7 @@ async function queryNextDNS(queryBuffer) {
 }
 
 // Perform DNS routing using NextDNS DoH (Primary) + Speculative UDP Parallel Multicast Racing (Backup)
-function raceDNS(queryBuffer, timeoutMs = 1200) {
+function raceDNS(queryBuffer, clientIp, timeoutMs = 1200) {
   return new Promise((resolve, reject) => {
     let resolved = false;
     let fallbackTimer = null;
@@ -437,7 +443,7 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
 
     if (!isTest) {
       // 1. Speculative Priority Lane: Query NextDNS DoH first to enforce customized adblock/security profile
-      queryNextDNS(queryBuffer).then((responseBuffer) => {
+      queryNextDNS(queryBuffer, clientIp).then((responseBuffer) => {
         if (resolved) return;
         cleanUp();
         
@@ -843,7 +849,7 @@ async function handleDoHInternal(queryBuffer, clientIp) {
           
           // Trigger asynchronous background revalidation
           setTimeout(() => {
-            raceDNS(queryBuffer, 1200)
+            raceDNS(queryBuffer, null, 1200)
               .then(({ responseBuffer }) => {
                 try {
                   const dnsRespObj = dnsPacket.decode(responseBuffer);
@@ -901,7 +907,7 @@ async function handleDoHInternal(queryBuffer, clientIp) {
   }
 
   try {
-    const { responseBuffer, from } = await raceDNS(queryBuffer, 1200);
+    const { responseBuffer, from } = await raceDNS(queryBuffer, clientIp, 1200);
     const latency = Date.now() - startTime;
     stats.totalLatency += latency;
     stats.averageLatency = stats.totalLatency / stats.totalQueries;
