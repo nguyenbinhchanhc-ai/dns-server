@@ -362,21 +362,41 @@ performHealthChecks().then(() => {
 setInterval(performHealthChecks, 25000);
 setInterval(updateCandidates, 5000); // Update rankings every 5s to keep CPU low
 
-// Perform DNS routing using All-Out Speculative Racing (Parallel Multicast)
+const NEXTDNS_DOH_URL = 'https://dns.nextdns.io/53ae9a';
+
+async function queryNextDNS(queryBuffer) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1200);
+  
+  try {
+    const res = await fetch(NEXTDNS_DOH_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/dns-message',
+        'Accept': 'application/dns-message',
+        'Cache-Control': 'no-cache'
+      },
+      body: queryBuffer,
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeout);
+    if (!res.ok) throw new Error('NextDNS HTTP error ' + res.status);
+    const arrayBuffer = await res.arrayBuffer();
+    return Buffer.from(arrayBuffer);
+  } catch (err) {
+    clearTimeout(timeout);
+    throw err;
+  }
+}
+
+// Perform DNS routing using NextDNS DoH (Primary) + Speculative UDP Parallel Multicast Racing (Backup)
 function raceDNS(queryBuffer, timeoutMs = 1200) {
   return new Promise((resolve, reject) => {
-    let candidates = activeCandidates;
-    const allOffline = candidates.length === 0 || candidates.every(c => c.status === 'Offline');
-    
-    if (allOffline) {
-      // Fail-Open: Fallback to standard public DNS upstreams directly to avoid outage
-      candidates = [
-        { ip: '1.1.1.1', name: 'Cloudflare Fallback', score: 50, avgLatency: 50, activeQueries: 0, consecutiveErrors: 0, jitter: 0, lossRate: 0, penalty: 0 },
-        { ip: '8.8.8.8', name: 'Google Fallback', score: 50, avgLatency: 50, activeQueries: 0, consecutiveErrors: 0, jitter: 0, lossRate: 0, penalty: 0 }
-      ];
-    }
-
-    const sock = getSocketFromPool(); // Pick a socket from pool for this query
+    let resolved = false;
+    let fallbackTimer = null;
+    const activeQueriesSet = new Set();
+    const sock = getSocketFromPool();
     const originalTxId = queryBuffer.readUInt16BE(0);
     const myTxId = getNextTxId();
 
@@ -384,39 +404,22 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
     upstreamQuery.writeUInt16BE(myTxId, 0);
 
     const startTime = Date.now();
-    
-    const queriedStates = new Set();
-    for (const state of candidates) {
-      state.activeQueries = (state.activeQueries || 0) + 1;
-      queriedStates.add(state);
-    }
 
-    const decrementActiveQueries = () => {
-      for (const state of queriedStates) {
+    const cleanUp = () => {
+      resolved = true;
+      if (fallbackTimer) clearTimeout(fallbackTimer);
+      // Decrement active queries for UDP states
+      for (const state of activeQueriesSet) {
         state.activeQueries = Math.max(0, state.activeQueries - 1);
       }
-      queriedStates.clear();
+      activeQueriesSet.clear();
+      pendingQueries.delete(myTxId);
     };
 
     const handleFailure = (state, penaltyAmount) => {
       state.realErrorsCount = (state.realErrorsCount || 0) + 1;
       state.penalty = Math.min(1000, (state.penalty || 0) + penaltyAmount);
       state.consecutiveErrors = (state.consecutiveErrors || 0) + 1;
-      
-      if (state.consecutiveErrors >= 5 && state.status !== 'Offline' && state.status !== undefined) {
-        state.status = 'Offline';
-        // Circuit Breaker Fast-Recheck after 3s
-        setTimeout(() => {
-          pingUpstream(state.ip).then(res => {
-            if (res.success) {
-              state.consecutiveErrors = 0;
-              state.status = 'Healthy';
-              state.recoveryTime = Date.now();
-              updateCandidates();
-            }
-          });
-        }, 3000);
-      }
       calculateScore(state);
     };
 
@@ -426,55 +429,86 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
       calculateScore(state);
     };
 
-    const timeout = setTimeout(() => {
-      pendingQueries.delete(myTxId);
-      decrementActiveQueries();
+    // 1. Speculative Priority Lane: Query NextDNS DoH first to enforce customized adblock/security profile
+    queryNextDNS(queryBuffer).then((responseBuffer) => {
+      if (resolved) return;
+      cleanUp();
+      
+      // Re-write the original transaction ID to the DoH response buffer before resolving
+      responseBuffer.writeUInt16BE(originalTxId, 0);
+      resolve({ responseBuffer, from: 'NextDNS DoH' });
+    }).catch((err) => {
+      // If NextDNS fails (e.g. timeout, network offline), immediately fail-open to UDP Racing Pool
+      if (resolved) return;
+      triggerFallback();
+    });
 
-      // All upstreams timed out/failed
-      candidates.forEach(state => handleFailure(state, 250));
+    // 2. Speculative Backup Trigger: If NextDNS doesn't answer within 150ms, fire UDP racing pool in parallel
+    fallbackTimer = setTimeout(() => {
+      triggerFallback();
+    }, 150);
 
-      reject(new Error('DNS query timeout'));
-    }, timeoutMs);
+    function triggerFallback() {
+      if (resolved) return;
+      
+      let candidates = activeCandidates;
+      const allOffline = candidates.length === 0 || candidates.every(c => c.status === 'Offline');
+      if (allOffline) {
+        candidates = [
+          { ip: '1.1.1.1', name: 'Cloudflare Fallback', score: 50, avgLatency: 50, activeQueries: 0, consecutiveErrors: 0, jitter: 0, lossRate: 0, penalty: 0 },
+          { ip: '8.8.8.8', name: 'Google Fallback', score: 50, avgLatency: 50, activeQueries: 0, consecutiveErrors: 0, jitter: 0, lossRate: 0, penalty: 0 }
+        ];
+      }
 
-    pendingQueries.set(myTxId, {
-      resolve: ({ buffer, from }) => {
-        clearTimeout(timeout);
-        decrementActiveQueries();
-        
-        const responseBuffer = Buffer.from(buffer);
-        responseBuffer.writeUInt16BE(originalTxId, 0);
-        
-        const winner = upstreamStates.find(s => s.ip === from) || candidates.find(c => c.ip === from);
-        if (winner) {
-          winner.routedQueries = (winner.routedQueries || 0) + 1;
-          const latency = Date.now() - startTime;
-          const alpha = 0.3;
-          winner.realAvgLatency = (winner.realQueriesCount || 0) === 0 
-            ? latency 
-            : Math.round(alpha * latency + (1 - alpha) * (winner.realAvgLatency || latency));
-          winner.realQueriesCount = (winner.realQueriesCount || 0) + 1;
+      // Register resolve handler for UDP racing pool
+      pendingQueries.set(myTxId, {
+        resolve: ({ buffer, from }) => {
+          if (resolved) return;
+          cleanUp();
           
-          handleSuccess(winner);
-        }
-
-        resolve({ responseBuffer, from });
-      },
-      reject: (err) => {
-        // Individual write error, wait for others or timeout
-      },
-      timeout
-    });
-
-    // Send query to all candidate upstreams concurrently
-    candidates.forEach(state => {
-      sock.send(upstreamQuery, 0, upstreamQuery.length, 53, state.ip, (err) => {
-        if (err) {
-          state.activeQueries = Math.max(0, state.activeQueries - 1);
-          queriedStates.delete(state);
-          handleFailure(state, 100);
-        }
+          const responseBuffer = Buffer.from(buffer);
+          responseBuffer.writeUInt16BE(originalTxId, 0);
+          
+          const winner = upstreamStates.find(s => s.ip === from) || candidates.find(c => c.ip === from);
+          if (winner) {
+            winner.routedQueries = (winner.routedQueries || 0) + 1;
+            const latency = Date.now() - startTime;
+            const alpha = 0.3;
+            winner.realAvgLatency = (winner.realQueriesCount || 0) === 0 
+              ? latency 
+              : Math.round(alpha * latency + (1 - alpha) * (winner.realAvgLatency || latency));
+            winner.realQueriesCount = (winner.realQueriesCount || 0) + 1;
+            handleSuccess(winner);
+          }
+          resolve({ responseBuffer, from });
+        },
+        reject: () => {
+          // Ignore individual write errors, wait for others or timeout
+        },
+        timeout: setTimeout(() => {
+          if (resolved) return;
+          cleanUp();
+          
+          // All UDP fallback upstreams timed out
+          candidates.forEach(state => handleFailure(state, 250));
+          reject(new Error('DNS query timeout'));
+        }, timeoutMs - (Date.now() - startTime))
       });
-    });
+
+      // Send to all healthy upstreams concurrently
+      candidates.forEach(state => {
+        state.activeQueries = (state.activeQueries || 0) + 1;
+        activeQueriesSet.add(state);
+
+        sock.send(upstreamQuery, 0, upstreamQuery.length, 53, state.ip, (err) => {
+          if (err) {
+            state.activeQueries = Math.max(0, state.activeQueries - 1);
+            activeQueriesSet.delete(state);
+            handleFailure(state, 100);
+          }
+        });
+      });
+    }
   });
 }
 
