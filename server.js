@@ -179,7 +179,7 @@ function overrideTtlInResponse(buffer) {
 }
 
 function safeCacheSet(key, value) {
-  if (cache.size >= 25000) {
+  if (cache.size >= 100000) { // Max 100,000 entries (leverages ~100MB of Render RAM)
     const firstKey = cache.keys().next().value;
     if (firstKey) cache.delete(firstKey);
   }
@@ -972,6 +972,18 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Endpoint 2.3: Live ping endpoint for client latency monitoring
+  if (parsedUrl.pathname === '/api/ping') {
+    res.writeHead(200, { 
+      'Content-Type': 'text/plain', 
+      'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+      'Pragma': 'no-cache',
+      'Expires': '0'
+    });
+    res.end('pong');
+    return;
+  }
+
   // Endpoint 2.5: Vietnam DNS Scanner
   if (parsedUrl.pathname === '/api/test-dns') {
     const ipsToTest = [
@@ -1371,6 +1383,13 @@ const server = http.createServer(async (req, res) => {
                 <div class="stat-title">Kích thước Racing Pool</div>
                 <div class="stat-value" id="pool-size">0<span class="stat-unit">servers</span></div>
             </div>
+            <div class="stat-card" style="border: 1px solid rgba(0, 242, 254, 0.25); box-shadow: 0 0 15px rgba(0, 242, 254, 0.08);">
+                <div class="stat-title" style="display: flex; align-items: center; gap: 6px;">
+                    <span style="width: 8px; height: 8px; border-radius: 50%; background: var(--color-healthy); box-shadow: 0 0 8px var(--color-healthy); display: inline-block; animation: pulse 1.5s infinite;"></span>
+                    Ping của bạn đến Server
+                </div>
+                <div class="stat-value" id="client-to-server-ping">--<span class="stat-unit">ms</span></div>
+            </div>
         </div>
 
         <div class="main-panel">
@@ -1434,6 +1453,15 @@ const server = http.createServer(async (req, res) => {
         }
 
         async function fetchStats() {
+            const startPing = performance.now();
+            let clientPing = null;
+            try {
+                const pingRes = await fetch('/api/ping');
+                if (pingRes.ok) {
+                    clientPing = Math.round(performance.now() - startPing);
+                }
+            } catch (e) {}
+
             try {
                 const res = await fetch('/api/stats');
                 const data = await res.json();
@@ -1444,6 +1472,12 @@ const server = http.createServer(async (req, res) => {
                 document.getElementById('swr-hits').innerText = data.swrHits.toLocaleString();
                 document.getElementById('avg-latency').innerHTML = Math.round(data.averageLatency) + '<span class="stat-unit">ms</span>';
                 document.getElementById('pool-size').innerHTML = data.poolSize + '<span class="stat-unit">servers</span>';
+                
+                if (clientPing !== null) {
+                    document.getElementById('client-to-server-ping').innerHTML = clientPing + '<span class="stat-unit">ms</span>';
+                } else {
+                    document.getElementById('client-to-server-ping').innerHTML = '--<span class="stat-unit">ms</span>';
+                }
 
                 const tableBody = document.getElementById('dns-table-body');
                 tableBody.innerHTML = '';
@@ -1534,7 +1568,23 @@ const server = http.createServer(async (req, res) => {
 server.keepAliveTimeout = 65000; // Keep HTTPS connection open for 65 seconds
 server.headersTimeout = 66000;
 
+function prewarmCache() {
+  const popularDomains = [
+    'google.com', 'facebook.com', 'youtube.com', 'shopee.vn', 'tiktok.com',
+    'vnexpress.net', 'zalo.me', 'messenger.com', 'tiki.vn', 'instagram.com',
+    'gmail.com', 'github.com', 'wikipedia.org', 'netflix.com', 'chatgpt.com',
+    'cloudflare.com', 'apple.com', 'microsoft.com', 'coccoc.com',
+    'dantri.com.vn', 'vietnamnet.vn', 'tuoitre.vn', 'kenh14.vn'
+  ];
+  
+  console.log(`[Khởi động] Đang nạp trước ${popularDomains.length} tên miền phổ biến vào RAM Cache...`);
+  popularDomains.forEach(domain => {
+    enqueuePrefetch(domain);
+  });
+}
+
 server.listen(PORT, () => {
   console.log("Antigravity Hyper-Speed DNS Server running on http://localhost:" + PORT);
   console.log("DNS health-check active monitoring started.");
+  prewarmCache();
 });
