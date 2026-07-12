@@ -1073,6 +1073,52 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // NextDNS Integration Details
+  const NEXTDNS_API_KEY = '54501e382010f84fac9b6dee5fb9b4472229f15e';
+  const NEXTDNS_PROFILE_ID = '53ae9a';
+
+  // Endpoint 2.1: Fetch NextDNS Profile Information from REST API
+  if (pathname === '/api/nextdns-profile') {
+    try {
+      const resProfile = await fetch('https://api.nextdns.io/profiles', {
+        headers: { 'X-Api-Key': NEXTDNS_API_KEY }
+      });
+      if (!resProfile.ok) {
+        res.writeHead(resProfile.status, { 'Content-Type': 'application/json' });
+        res.end(await resProfile.text());
+        return;
+      }
+      const data = await resProfile.json();
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end(err.message);
+    }
+    return;
+  }
+
+  // Endpoint 2.2: Fetch NextDNS Live Query Logs from REST API
+  if (pathname === '/api/nextdns-logs') {
+    try {
+      const resLogs = await fetch(`https://api.nextdns.io/profiles/${NEXTDNS_PROFILE_ID}/logs?limit=25`, {
+        headers: { 'X-Api-Key': NEXTDNS_API_KEY }
+      });
+      if (!resLogs.ok) {
+        res.writeHead(resLogs.status, { 'Content-Type': 'application/json' });
+        res.end(await resLogs.text());
+        return;
+      }
+      const data = await resLogs.json();
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end(err.message);
+    }
+    return;
+  }
+
   // Endpoint 2.5: Vietnam DNS Scanner
   if (pathname === '/api/test-dns') {
     const ipsToTest = [
@@ -1477,6 +1523,13 @@ const server = http.createServer(async (req, res) => {
                 </div>
                 <div class="stat-value" id="client-to-server-ping">--<span class="stat-unit">ms</span></div>
             </div>
+            <div class="stat-card" style="border: 1px solid rgba(168, 85, 247, 0.3); box-shadow: 0 0 15px rgba(168, 85, 247, 0.08);">
+                <div class="stat-title" style="display: flex; align-items: center; gap: 6px;">
+                    <span style="width: 8px; height: 8px; border-radius: 50%; background: #a855f7; box-shadow: 0 0 8px #a855f7; display: inline-block;"></span>
+                    Hồ sơ NextDNS liên kết
+                </div>
+                <div class="stat-value" id="nextdns-profile-name" style="font-size: 1.6rem; color: #c084fc;">Đang tải...</div>
+            </div>
         </div>
 
         <div class="main-panel">
@@ -1511,7 +1564,34 @@ const server = http.createServer(async (req, res) => {
                 <span id="doh-url">https://${host}/dns-query</span>
                 <button class="btn-copy" onclick="copyUrl()">Sao chép</button>
             </div>
+        </div>
 
+        <div class="main-panel" style="margin-top: 30px; border-left: 4px solid #a855f7;">
+            <h2 style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                <span style="display: flex; align-items: center; gap: 8px;">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#c084fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
+                    Nhật ký chặn lọc NextDNS thời gian thực (Live Query Logs)
+                </span>
+                <span style="font-size: 0.8rem; padding: 4px 8px; background: rgba(168, 85, 247, 0.12); border: 1px solid rgba(168, 85, 247, 0.25); border-radius: 6px; color: #c084fc;">Đang đồng bộ trực tiếp từ API...</span>
+            </h2>
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Thời gian</th>
+                            <th>Tên miền</th>
+                            <th>IP Thiết bị</th>
+                            <th>Trạng thái</th>
+                            <th>Chi tiết bộ lọc</th>
+                        </tr>
+                    </thead>
+                    <tbody id="nextdns-logs-body">
+                        <tr>
+                            <td colspan="5" style="text-align: center; color: var(--text-muted); padding: 30px;">Đang tải danh sách nhật ký từ API NextDNS...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
         </div>
 
 
@@ -1641,8 +1721,70 @@ const server = http.createServer(async (req, res) => {
             return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
         }
 
+        async function fetchNextDNSProfile() {
+            try {
+                const res = await fetch('/api/nextdns-profile');
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.data && data.data.length > 0) {
+                        const profile = data.data[0];
+                        document.getElementById('nextdns-profile-name').innerText = profile.name + ' (' + profile.id + ')';
+                    }
+                }
+            } catch (e) {
+                console.error('Error fetching NextDNS profile:', e);
+            }
+        }
+
+        async function fetchNextDNSLogs() {
+            try {
+                const res = await fetch('/api/nextdns-logs');
+                if (res.ok) {
+                    const data = await res.json();
+                    const logsBody = document.getElementById('nextdns-logs-body');
+                    logsBody.innerHTML = '';
+
+                    const logs = data.data || [];
+                    if (logs.length === 0) {
+                        logsBody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-muted); padding: 20px;">Không có nhật ký nào được ghi nhận.</td></tr>';
+                        return;
+                    }
+
+                    logs.forEach(item => {
+                        const dateStr = new Date(item.timestamp).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                        
+                        let statusBadge = '';
+                        if (item.status === 'blocked') {
+                            statusBadge = '<span class="dns-rank-badge rank-offline" style="padding: 2px 6px;">Đã chặn</span>';
+                        } else {
+                            statusBadge = '<span class="dns-rank-badge rank-primary" style="background: rgba(0, 255, 170, 0.12); color: var(--color-healthy); border: 1px solid rgba(0, 255, 170, 0.25); padding: 2px 6px;">Bình thường</span>';
+                        }
+
+                        let reasonsStr = '--';
+                        if (item.status === 'blocked' && item.reasons && item.reasons.length > 0) {
+                            reasonsStr = item.reasons.map(r => r.name).join(', ');
+                        }
+
+                        const row = document.createElement('tr');
+                        row.innerHTML = '<td><span style="color: var(--text-muted); font-size: 0.85rem;">' + dateStr + '</span></td>' +
+                            '<td><strong style="color: var(--text-color);">' + escapeHtml(item.domain) + '</strong></td>' +
+                            '<td style="font-family: monospace; font-size: 0.85rem;">' + escapeHtml(item.clientIp || '--') + '</td>' +
+                            '<td>' + statusBadge + '</td>' +
+                            '<td style="font-size: 0.85rem; color: #a855f7; max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="' + escapeHtml(reasonsStr) + '">' + escapeHtml(reasonsStr) + '</td>';
+                        logsBody.appendChild(row);
+                    });
+                }
+            } catch (e) {
+                console.error('Error fetching NextDNS logs:', e);
+            }
+        }
+
         fetchStats();
         setInterval(fetchStats, 3000);
+
+        fetchNextDNSProfile();
+        fetchNextDNSLogs();
+        setInterval(fetchNextDNSLogs, 4000);
     </script>
 </body>
 </html>`;
