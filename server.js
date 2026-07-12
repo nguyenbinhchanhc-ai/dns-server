@@ -362,7 +362,7 @@ performHealthChecks().then(() => {
 setInterval(performHealthChecks, 25000);
 setInterval(updateCandidates, 5000); // Update rankings every 5s to keep CPU low
 
-// Perform DNS routing using Dynamic Weighted Load Balancing + Speculative Backup Retry (Dynamic delay)
+// Perform DNS routing using All-Out Speculative Racing (Parallel Multicast)
 function raceDNS(queryBuffer, timeoutMs = 1200) {
   return new Promise((resolve, reject) => {
     let candidates = activeCandidates;
@@ -384,20 +384,12 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
     upstreamQuery.writeUInt16BE(myTxId, 0);
 
     const startTime = Date.now();
-    const primary = selectWeightedUpstream(candidates);
-    const secondaryCandidates = candidates.filter(c => c.ip !== primary.ip);
-    const secondary = secondaryCandidates.length > 0 ? selectWeightedUpstream(secondaryCandidates) : null;
     
     const queriedStates = new Set();
-    primary.activeQueries = (primary.activeQueries || 0) + 1;
-    queriedStates.add(primary);
-    if (secondary) {
-      secondary.activeQueries = (secondary.activeQueries || 0) + 1;
-      queriedStates.add(secondary);
+    for (const state of candidates) {
+      state.activeQueries = (state.activeQueries || 0) + 1;
+      queriedStates.add(state);
     }
-
-    let backupStarted = false;
-    let backupTimer = null;
 
     const decrementActiveQueries = () => {
       for (const state of queriedStates) {
@@ -436,11 +428,10 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
 
     const timeout = setTimeout(() => {
       pendingQueries.delete(myTxId);
-      if (backupTimer) clearTimeout(backupTimer);
       decrementActiveQueries();
 
-      const queried = backupStarted ? candidates : (secondary ? [primary, secondary] : [primary]);
-      queried.forEach(state => handleFailure(state, 250));
+      // All upstreams timed out/failed
+      candidates.forEach(state => handleFailure(state, 250));
 
       reject(new Error('DNS query timeout'));
     }, timeoutMs);
@@ -448,7 +439,6 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
     pendingQueries.set(myTxId, {
       resolve: ({ buffer, from }) => {
         clearTimeout(timeout);
-        if (backupTimer) clearTimeout(backupTimer);
         decrementActiveQueries();
         
         const responseBuffer = Buffer.from(buffer);
@@ -470,65 +460,21 @@ function raceDNS(queryBuffer, timeoutMs = 1200) {
         resolve({ responseBuffer, from });
       },
       reject: (err) => {
-        clearTimeout(timeout);
-        if (backupTimer) clearTimeout(backupTimer);
-        pendingQueries.delete(myTxId);
-        decrementActiveQueries();
-        
-        const queried = backupStarted ? candidates : (secondary ? [primary, secondary] : [primary]);
-        queried.forEach(state => handleFailure(state, 200));
-
-        reject(err);
+        // Individual write error, wait for others or timeout
       },
       timeout
     });
 
-    // Send query to primary
-    sock.send(upstreamQuery, 0, upstreamQuery.length, 53, primary.ip, (err) => {
-      if (err) {
-        if (backupTimer) clearTimeout(backupTimer);
-        triggerBackup();
-      }
-    });
-
-    // Send query to secondary (Racing Parallel Resolution)
-    if (secondary) {
-      sock.send(upstreamQuery, 0, upstreamQuery.length, 53, secondary.ip, (err) => {
+    // Send query to all candidate upstreams concurrently
+    candidates.forEach(state => {
+      sock.send(upstreamQuery, 0, upstreamQuery.length, 53, state.ip, (err) => {
         if (err) {
-          // Non-fatal error
+          state.activeQueries = Math.max(0, state.activeQueries - 1);
+          queriedStates.delete(state);
+          handleFailure(state, 100);
         }
       });
-    }
-
-    // Dynamic Speculative Backup Delay: wait only 1.4x of primary's latency (min 70ms, max 250ms)
-    const backupDelay = Math.max(70, Math.min(250, Math.round(primary.avgLatency * 1.4)));
-    
-    backupTimer = setTimeout(() => {
-      triggerBackup();
-    }, backupDelay);
-
-    function triggerBackup() {
-      if (backupStarted) return;
-      backupStarted = true;
-
-      // Send query to the top 2 fastest backup candidates (excluding primary & secondary)
-      let sentCount = 0;
-      for (const state of candidates) {
-        if (state.ip !== primary.ip && (!secondary || state.ip !== secondary.ip) && sentCount < 2) {
-          state.activeQueries = (state.activeQueries || 0) + 1;
-          queriedStates.add(state);
-
-          sock.send(upstreamQuery, 0, upstreamQuery.length, 53, state.ip, (err) => {
-            if (err) {
-              state.activeQueries = Math.max(0, state.activeQueries - 1);
-              queriedStates.delete(state);
-              handleFailure(state, 100);
-            }
-          });
-          sentCount++;
-        }
-      }
-    }
+    });
   });
 }
 
