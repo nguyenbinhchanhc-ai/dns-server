@@ -689,7 +689,34 @@ function isValidPublicIp(ip) {
   return true;
 }
 
+let activeClientQueries = 0;
+const MAX_CONCURRENT_CLIENT_QUERIES = 250;
+
 async function handleDoH(queryBuffer, clientIp) {
+  if (activeClientQueries >= MAX_CONCURRENT_CLIENT_QUERIES) {
+    stats.errors++;
+    try {
+      const decodedQuery = dnsPacket.decode(queryBuffer);
+      return dnsPacket.encode({
+        type: 'response',
+        id: decodedQuery.id,
+        flags: dnsPacket.AUTHORITATIVE_ANSWER | 2, // SERVFAIL
+        questions: decodedQuery.questions
+      });
+    } catch (e) {
+      throw new Error('Server Busy');
+    }
+  }
+
+  activeClientQueries++;
+  try {
+    return await handleDoHInternal(queryBuffer, clientIp);
+  } finally {
+    activeClientQueries--;
+  }
+}
+
+async function handleDoHInternal(queryBuffer, clientIp) {
   const startTime = Date.now();
   stats.totalQueries++;
 
@@ -890,7 +917,23 @@ async function handleDoH(queryBuffer, clientIp) {
 }
 
 // HTTP Server
+// HTTP Server
 const server = http.createServer(async (req, res) => {
+  // 1. Fast-Path Client Ping Monitor (Priority lane: absolute minimum processing RTT)
+  const urlParts = req.url.split('?');
+  const pathname = urlParts[0];
+
+  if (pathname === '/api/ping') {
+    res.writeHead(200, { 
+      'Content-Type': 'text/plain', 
+      'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+      'Pragma': 'no-cache',
+      'Expires': '0'
+    });
+    res.end('pong');
+    return;
+  }
+
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -901,16 +944,23 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  // Parse query parameters manually only when needed (extremely fast)
+  let searchParams = null;
+  const getSearchParam = (name) => {
+    if (!searchParams) {
+      searchParams = new URLSearchParams(urlParts[1] || '');
+    }
+    return searchParams.get(name);
+  };
 
   // Endpoint 1: DoH Handler
-  if (parsedUrl.pathname === '/dns-query') {
+  if (pathname === '/dns-query') {
     const clientIp = req.headers['x-forwarded-for']
       ? req.headers['x-forwarded-for'].split(',')[0].trim()
       : req.socket.remoteAddress;
 
     if (req.method === 'GET') {
-      const dnsParam = parsedUrl.searchParams.get('dns');
+      const dnsParam = getSearchParam('dns');
       if (!dnsParam) {
         res.writeHead(400, { 'Content-Type': 'text/plain' });
         res.end('Missing dns parameter');
@@ -960,7 +1010,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // Endpoint 2: JSON API Stats (Includes detailed load balance & SWR data)
-  if (parsedUrl.pathname === '/api/stats') {
+  if (pathname === '/api/stats') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ...stats,
@@ -972,20 +1022,8 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Endpoint 2.3: Live ping endpoint for client latency monitoring
-  if (parsedUrl.pathname === '/api/ping') {
-    res.writeHead(200, { 
-      'Content-Type': 'text/plain', 
-      'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
-      'Pragma': 'no-cache',
-      'Expires': '0'
-    });
-    res.end('pong');
-    return;
-  }
-
   // Endpoint 2.5: Vietnam DNS Scanner
-  if (parsedUrl.pathname === '/api/test-dns') {
+  if (pathname === '/api/test-dns') {
     const ipsToTest = [
       { ip: '203.113.131.1', name: 'Viettel Primary' },
       { ip: '203.113.131.2', name: 'Viettel Secondary' },
@@ -1025,10 +1063,8 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-
-
   // Endpoint 4: Premium Web Dashboard UI
-  if (parsedUrl.pathname === '/') {
+  if (pathname === '/') {
     const host = req.headers.host || 'localhost';
     const html = `<!DOCTYPE html>
 <html lang="vi">
