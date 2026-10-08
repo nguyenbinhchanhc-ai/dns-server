@@ -1,8 +1,9 @@
-const app = require('../server.js');
-
-const handler = typeof app === 'function' 
-  ? app 
-  : (app.handler || ((req, res) => app.server.emit('request', req, res)));
+const { handler } = require('../server.js');
 
 module.exports = handler;
 
+module.exports.config = {
+  api: {
+    bodyParser: false,
+  },
+};

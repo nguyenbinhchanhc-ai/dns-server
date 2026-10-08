@@ -6,122 +6,108 @@ const dnsPacket = require('dns-packet');
 const PORT = process.env.PORT || 3000;
 const isVercel = Boolean(process.env.VERCEL || process.env.NOW_REGION || process.env.AWS_LAMBDA_FUNCTION_NAME);
 
-// Persistent HTTPS Connection Pooling for sub-10ms DoH resolution
+// Persistent, high-performance HTTPS Agent with Keep-Alive & Connection Pooling
 const httpsAgent = new https.Agent({
   keepAlive: true,
   keepAliveMsecs: 60000,
-  maxSockets: 64,
-  maxFreeSockets: 20,
+  maxSockets: 50,
+  maxFreeSockets: 25,
   timeout: 3000,
   rejectUnauthorized: false
 });
 
-// High-Performance Upstream DNS Servers List (Dual-Engine: DoH HTTPS + Anycast IP)
+// Upstream DoH Resolvers (IP-based URLs prevent bootstrap lookup cycles)
 const UPSTREAMS = [
-  { ip: '1.1.1.1', name: 'Cloudflare Primary', dohUrl: 'https://1.1.1.1/dns-query' },
-  { ip: '1.0.0.1', name: 'Cloudflare Secondary', dohUrl: 'https://1.0.0.1/dns-query' },
-  { ip: '8.8.8.8', name: 'Google Primary', dohUrl: 'https://8.8.8.8/dns-query' },
-  { ip: '8.8.4.4', name: 'Google Secondary', dohUrl: 'https://8.8.4.4/dns-query' },
-  { ip: '9.9.9.9', name: 'Quad9 Security', dohUrl: 'https://dns.quad9.net/dns-query' },
-  { ip: '208.67.222.222', name: 'OpenDNS Home', dohUrl: 'https://doh.opendns.com/dns-query' },
-  { ip: '94.140.14.14', name: 'AdGuard Default', dohUrl: 'https://dns.adguard-dns.com/dns-query' },
-  { ip: '76.76.2.0', name: 'ControlD Unfiltered', dohUrl: 'https://freedns.controld.com/p0' },
-  { ip: '203.113.131.1', name: 'Viettel Primary', dohUrl: 'https://1.1.1.1/dns-query' },
-  { ip: '203.162.0.11', name: 'VNPT Backup', dohUrl: 'https://8.8.8.8/dns-query' },
-  { ip: '203.113.131.2', name: 'Viettel Secondary', dohUrl: 'https://1.0.0.1/dns-query' },
-  { ip: '210.245.24.20', name: 'FPT Primary', dohUrl: 'https://8.8.4.4/dns-query' }
+  { name: 'Cloudflare Primary', ip: '1.1.1.1', dohUrl: 'https://1.1.1.1/dns-query' },
+  { name: 'Cloudflare Secondary', ip: '1.0.0.1', dohUrl: 'https://1.0.0.1/dns-query' },
+  { name: 'Google Primary', ip: '8.8.8.8', dohUrl: 'https://8.8.8.8/dns-query' },
+  { name: 'Google Secondary', ip: '8.8.4.4', dohUrl: 'https://8.8.4.4/dns-query' },
+  { name: 'Quad9 Primary', ip: '9.9.9.9', dohUrl: 'https://9.9.9.9/dns-query' },
+  { name: 'Quad9 Secondary', ip: '149.112.112.112', dohUrl: 'https://149.112.112.112/dns-query' },
+  { name: 'AdGuard Standard', ip: '94.140.14.14', dohUrl: 'https://94.140.14.14/dns-query' },
+  { name: 'AdGuard Alt', ip: '94.140.15.15', dohUrl: 'https://94.140.15.15/dns-query' },
+  { name: 'ControlD Free', ip: '76.76.2.0', dohUrl: 'https://76.76.2.0/dns-query' },
+  { name: 'OpenDNS Primary', ip: '208.67.222.222', dohUrl: 'https://208.67.222.222/dns-query' },
+  { name: 'DNS.SB Primary', ip: '45.11.45.11', dohUrl: 'https://45.11.45.11/dns-query' },
+  { name: 'Mullvad Primary', ip: '194.242.2.2', dohUrl: 'https://194.242.2.2/dns-query' }
 ];
 
-// Global Metrics & Telemetry
+// Health and telemetry state per upstream
+const upstreamStates = UPSTREAMS.map(u => ({
+  ...u,
+  avgLatency: 20,
+  realAvgLatency: 20,
+  penalty: 0,
+  status: 'Healthy',
+  consecutiveErrors: 0,
+  routedQueries: 0,
+  activeQueries: 0,
+  realQueriesCount: 0,
+  realErrorsCount: 0
+}));
+
+let currentPoolSize = 4;
+
+function calculateScore(state) {
+  const effectiveLatency = state.realAvgLatency || state.avgLatency || 25;
+  const loadPenalty = (state.activeQueries || 0) * 15;
+  return effectiveLatency + (state.penalty || 0) + loadPenalty;
+}
+
+function updateCandidates() {
+  const healthyCount = upstreamStates.filter(s => s.status === 'Healthy').length;
+  if (healthyCount < 3) {
+    currentPoolSize = 3;
+  } else if (healthyCount <= 4) {
+    currentPoolSize = 3;
+  } else {
+    currentPoolSize = 4;
+  }
+}
+
+// In-Memory Cache with Stale-While-Revalidate (SWR)
+const cache = new Map();
+const coalescedQueries = new Map();
+const activeRevalidations = new Set();
+
 const stats = {
   totalQueries: 0,
   cacheHits: 0,
-  swrHits: 0,
   cacheMisses: 0,
+  swrHits: 0,
   errors: 0,
   totalLatency: 0,
   averageLatency: 0
 };
 
-// Upstream Performance & Health Registry
-const upstreamStates = UPSTREAMS.map(dns => ({
-  ip: dns.ip,
-  name: dns.name,
-  dohUrl: dns.dohUrl,
-  pings: [25, 20, 22],
-  successCount: 10,
-  failCount: 0,
-  avgLatency: 22,
-  lossRate: 0,
-  realAvgLatency: 20,
-  realQueriesCount: 0,
-  realErrorsCount: 0,
-  penalty: 0,
-  jitter: 2,
-  score: 22,
-  routedQueries: 0,
-  status: 'Healthy',
-  activeQueries: 0,
-  consecutiveErrors: 0,
-  recoveryTime: null
-}));
-
-// Score Calculator: Latency + Loss + Penalty + Jitter + Outstanding Concurrency
-function calculateScore(state) {
-  const jitterPenalty = state.jitter > 15 ? state.jitter * 2 : 0;
-  const concurrencyPenalty = (state.activeQueries || 0) * 30;
-  state.score = state.avgLatency + (state.lossRate * 5) + (state.penalty || 0) + jitterPenalty + concurrencyPenalty;
-  return Math.max(1, Math.round(state.score));
-}
-
-let currentPoolSize = 3;
-
-function updateCandidates() {
-  const sorted = [...upstreamStates]
-    .filter(s => s.status !== 'Offline')
-    .sort((a, b) => a.score - b.score);
-
-  if (sorted.length >= 3) {
-    currentPoolSize = 3;
-  } else {
-    currentPoolSize = Math.max(2, sorted.length);
-  }
-}
-
-// In-Memory DNS Cache (Key: name:type:class)
-const cache = new Map();
-const activeRevalidations = new Set();
-const coalescedQueries = new Map();
 const recentQueries = [];
-
 function recordRecentQuery(domain, type, upstreamName, upstreamIp, latency, status) {
   recentQueries.unshift({
     timestamp: Date.now(),
-    domain: domain || 'unknown',
-    type: type || 'A',
-    upstreamName: upstreamName || 'Cache',
-    upstreamIp: upstreamIp || '-',
-    latency: Math.max(0, Math.round(latency || 0)),
-    status: status || 'Resolved'
+    domain,
+    type,
+    upstreamName,
+    upstreamIp,
+    latency,
+    status
   });
-  if (recentQueries.length > 30) {
-    recentQueries.pop();
-  }
+  if (recentQueries.length > 30) recentQueries.pop();
 }
 
 function overrideTtlInResponse(buffer) {
   try {
     const decoded = dnsPacket.decode(buffer);
-    let changed = false;
-    if (decoded.answers) {
-      decoded.answers.forEach(ans => {
-        if (ans.ttl !== undefined && ans.ttl < 600) {
-          ans.ttl = 600; // Force 10 minutes cache TTL for client performance
-          changed = true;
-        }
-      });
-    }
-    return changed ? dnsPacket.encode(decoded) : buffer;
+    let modified = false;
+    const clampTTL = (rec) => {
+      if (rec && typeof rec.ttl === 'number') {
+        if (rec.ttl < 60) { rec.ttl = 60; modified = true; }
+        else if (rec.ttl > 86400) { rec.ttl = 86400; modified = true; }
+      }
+    };
+    if (decoded.answers) decoded.answers.forEach(clampTTL);
+    if (decoded.authorities) decoded.authorities.forEach(clampTTL);
+    if (decoded.additionals) decoded.additionals.forEach(clampTTL);
+    return modified ? dnsPacket.encode(decoded) : buffer;
   } catch (e) {
     return buffer;
   }
@@ -171,12 +157,17 @@ function base64urlDecode(str) {
   return Buffer.from(base64, 'base64');
 }
 
-// Robust Request Body Extractor (Guaranteed zero-freeze in Vercel & Node.js)
+// Robust Request Body Extractor (Handles Buffer, String, Object, and Stream safely)
 async function getRequestBody(req) {
   if (req.body) {
     if (Buffer.isBuffer(req.body)) return req.body;
-    if (typeof req.body === 'string') return Buffer.from(req.body);
-    if (typeof req.body === 'object') return Buffer.from(JSON.stringify(req.body));
+    if (typeof req.body === 'string') return Buffer.from(req.body, 'binary');
+    if (typeof req.body === 'object') {
+      if (req.body.type === 'Buffer' && Array.isArray(req.body.data)) {
+        return Buffer.from(req.body.data);
+      }
+      return Buffer.from(JSON.stringify(req.body));
+    }
   }
   if (req.readableEnded) {
     return Buffer.alloc(0);
@@ -192,12 +183,12 @@ async function getRequestBody(req) {
     req.on('data', chunk => chunks.push(chunk));
     req.on('end', finish);
     req.on('error', finish);
-    const timer = setTimeout(finish, 2500); // 2.5s safety timeout
+    const timer = setTimeout(finish, 2500);
     if (timer.unref) timer.unref();
   });
 }
 
-// Query single DoH upstream with keep-alive connection
+// Query single DoH upstream with keep-alive HTTPS connection
 function queryDoHUpstream(upstream, queryBuffer, timeoutMs = 2000) {
   return new Promise((resolve, reject) => {
     const t0 = Date.now();
@@ -244,16 +235,13 @@ function queryDoHUpstream(upstream, queryBuffer, timeoutMs = 2000) {
   });
 }
 
-// Weighted Fair Candidate Selection with Power-of-Choices
+// Select candidates for racing
 function selectRacingCandidates(count = 3) {
   const healthy = upstreamStates.filter(s => s.status !== 'Offline');
   if (healthy.length <= count) {
     return [...healthy];
   }
 
-  // Calculate dynamic lottery weights:
-  // Lower score -> higher weight
-  // Add fairness multiplier to distribute traffic across all upstreams
   const pool = healthy.map(c => {
     const scoreVal = Math.max(1, calculateScore(c));
     const fairnessBonus = 1.0 + Math.max(0, 0.8 - (c.routedQueries || 0) * 0.05);
@@ -263,10 +251,9 @@ function selectRacingCandidates(count = 3) {
 
   const selected = [];
   const available = [...pool];
-  const targetCount = Math.min(count, available.length);
 
-  for (let i = 0; i < targetCount; i++) {
-    const totalWeight = available.reduce((sum, item) => sum + item.weight, 0);
+  for (let i = 0; i < count && available.length > 0; i++) {
+    const totalWeight = available.reduce((acc, cur) => acc + cur.weight, 0);
     let rand = Math.random() * totalWeight;
     let chosenIdx = 0;
     for (let j = 0; j < available.length; j++) {
@@ -283,18 +270,16 @@ function selectRacingCandidates(count = 3) {
   return selected;
 }
 
-// Hedged Racing Engine: Races 2-3 candidate upstreams concurrently
+// Hedged Racing Engine
 async function raceDNS(queryBuffer, clientIp = null, timeoutMs = 1800) {
   const originalTxId = queryBuffer.readUInt16BE(0);
   const candidates = selectRacingCandidates(currentPoolSize || 3);
 
-  // Mark active queries
   candidates.forEach(c => {
     c.activeQueries = (c.activeQueries || 0) + 1;
   });
 
   try {
-    // Race candidates in parallel using Promise.any
     const racePromises = candidates.map(upstream =>
       queryDoHUpstream(upstream, queryBuffer, timeoutMs)
     );
@@ -303,10 +288,8 @@ async function raceDNS(queryBuffer, clientIp = null, timeoutMs = 1800) {
     const winner = winnerRes.upstream;
     const responseBuffer = Buffer.from(winnerRes.buffer);
     
-    // Ensure response has client's original transaction ID
     responseBuffer.writeUInt16BE(originalTxId, 0);
 
-    // Update telemetry
     winner.routedQueries = (winner.routedQueries || 0) + 1;
     winner.consecutiveErrors = 0;
     winner.penalty = Math.max(0, (winner.penalty || 0) - 15);
@@ -328,25 +311,24 @@ async function raceDNS(queryBuffer, clientIp = null, timeoutMs = 1800) {
     candidates.forEach(c => {
       c.realErrorsCount = (c.realErrorsCount || 0) + 1;
       c.penalty = Math.min(800, (c.penalty || 0) + 100);
-      calculateScore(c);
+      c.consecutiveErrors = (c.consecutiveErrors || 0) + 1;
+      if (c.consecutiveErrors >= 3) {
+        c.status = 'Degraded';
+      }
     });
 
-    // Last-Resort Emergency Fallback (Direct Cloudflare 1.1.1.1 DoH)
+    const fallbackCandidate = upstreamStates.find(u => u.name.includes('Google') || u.name.includes('Cloudflare')) || upstreamStates[0];
     try {
-      const emergencyRes = await queryDoHUpstream(
-        { name: 'Cloudflare Fallback', dohUrl: 'https://1.1.1.1/dns-query' },
-        queryBuffer,
-        1500
-      );
-      const resBuf = Buffer.from(emergencyRes.buffer);
+      const fbRes = await queryDoHUpstream(fallbackCandidate, queryBuffer, 2200);
+      const resBuf = Buffer.from(fbRes.buffer);
       resBuf.writeUInt16BE(originalTxId, 0);
       return {
         responseBuffer: resBuf,
-        from: 'Cloudflare Fallback',
-        winner: upstreamStates[0]
+        from: fallbackCandidate.name,
+        winner: fallbackCandidate
       };
-    } catch (fallbackErr) {
-      throw new Error('All DNS upstreams failed or timed out: ' + err.message);
+    } catch (fbErr) {
+      throw new Error(`All upstreams timed out (${err.message})`);
     }
   } finally {
     candidates.forEach(c => {
@@ -369,7 +351,7 @@ function isValidPublicIp(ip) {
   return true;
 }
 
-// Core DoH Handler with In-Memory Caching & Stale-While-Revalidate (SWR)
+// Core DoH Handler with In-Memory Caching & SWR
 async function handleDoH(queryBuffer, clientIp) {
   const startTime = Date.now();
   stats.totalQueries++;
@@ -429,7 +411,6 @@ async function handleDoH(queryBuffer, clientIp) {
   if (cacheKey && cache.has(cacheKey)) {
     const cachedEntry = cache.get(cacheKey);
 
-    // Stale-While-Revalidate (SWR) within 24h window
     if (now < cachedEntry.swrExpiresAt) {
       const isFresh = now < cachedEntry.expiresAt;
       const shouldRevalidate = !isFresh;
@@ -440,7 +421,6 @@ async function handleDoH(queryBuffer, clientIp) {
         recordRecentQuery(q0 ? q0.name : 'query', q0 ? q0.type : 'A', 'Bộ nhớ đệm SWR', '0ms (Stale)', 0, 'SWR Hit');
         activeRevalidations.add(cacheKey);
 
-        // Async background refresh
         raceDNS(queryBuffer, clientIp).then(revalRes => {
           try {
             const revalDecoded = dnsPacket.decode(revalRes.responseBuffer);
@@ -468,7 +448,7 @@ async function handleDoH(queryBuffer, clientIp) {
     }
   }
 
-  // 2. Request Coalescing (Deduplicate in-flight requests)
+  // 2. Request Coalescing
   if (cacheKey && coalescedQueries.has(cacheKey)) {
     try {
       const sharedRes = await coalescedQueries.get(cacheKey);
@@ -503,7 +483,6 @@ async function handleDoH(queryBuffer, clientIp) {
       'Resolved'
     );
 
-    // Save to Cache
     if (cacheKey) {
       try {
         const decodedResp = dnsPacket.decode(responseBuffer);
@@ -520,9 +499,8 @@ async function handleDoH(queryBuffer, clientIp) {
   } catch (err) {
     stats.errors++;
     const q0 = dnsQueryObj.questions && dnsQueryObj.questions[0];
-    recordRecentQuery(q0 ? q0.name : 'query', q0 ? q0.type : 'A', 'Thất bại', '-', Date.now() - startTime, 'Timeout/Error');
+    recordRecentQuery(q0 ? q0.name : 'query', q0 ? q0.type : 'A', 'Thất bại', '-', Date.now() - startTime, 'SERVFAIL');
 
-    // Return friendly SERVFAIL
     try {
       return dnsPacket.encode({
         type: 'response',
@@ -540,14 +518,14 @@ async function handleDoH(queryBuffer, clientIp) {
   }
 }
 
-// Request Handler (Vercel Serverless Function & Node.js HTTP Server)
-const handler = async (req, res) => {
-  const urlParts = (req.url || '/').split('?');
-  const pathname = urlParts[0];
+// -------------------------------------------------------------
+// DEDICATED REQUEST HANDLERS (No HTML leaks to DNS clients)
+// -------------------------------------------------------------
 
-  // CORS Headers for Web & DoH Clients
+// DoH Request Handler (RFC 8484 compliant)
+async function handleDoHRequest(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Cache-Control');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
 
   if (req.method === 'OPTIONS') {
@@ -556,118 +534,70 @@ const handler = async (req, res) => {
     return;
   }
 
-  // Fast-Path Ping (Health Check)
-  if (pathname === '/api/ping') {
-    res.writeHead(200, {
-      'Content-Type': 'text/plain',
-      'Cache-Control': 'no-store, no-cache, must-revalidate'
-    });
-    res.end('pong');
+  const clientIp = req.headers['x-forwarded-for']
+    ? req.headers['x-forwarded-for'].split(',')[0].trim()
+    : (req.headers['x-real-ip'] || (req.socket ? req.socket.remoteAddress : '127.0.0.1'));
+
+  const urlParts = (req.url || '/').split('?');
+  const searchParams = new URLSearchParams(urlParts[1] || '');
+
+  // 1. POST Method (Standard RFC 8484 Binary Wireformat)
+  if (req.method === 'POST') {
+    let queryBuffer;
+    try {
+      queryBuffer = await getRequestBody(req);
+    } catch (readErr) {
+      res.writeHead(400, { 'Content-Type': 'text/plain' });
+      res.end('Failed to read request body');
+      return;
+    }
+
+    if (!queryBuffer || queryBuffer.length < 12) {
+      res.writeHead(400, { 'Content-Type': 'text/plain' });
+      res.end('Empty or malformed DNS wireformat body');
+      return;
+    }
+
+    try {
+      const responseBuffer = await handleDoH(queryBuffer, clientIp);
+      res.writeHead(200, {
+        'Content-Type': 'application/dns-message',
+        'Content-Length': responseBuffer.length,
+        'Cache-Control': 'public, max-age=60, s-maxage=300, stale-while-revalidate=86400'
+      });
+      res.end(responseBuffer);
+    } catch (err) {
+      try {
+        const decoded = dnsPacket.decode(queryBuffer);
+        const failBuf = dnsPacket.encode({
+          type: 'response',
+          id: decoded.id,
+          flags: dnsPacket.AUTHORITATIVE_ANSWER | 2,
+          questions: decoded.questions
+        });
+        res.writeHead(200, {
+          'Content-Type': 'application/dns-message',
+          'Content-Length': failBuf.length
+        });
+        res.end(failBuf);
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.end('DNS Error: ' + err.message);
+      }
+    }
     return;
   }
 
-  // Fast Query Param Parser
-  let searchParams = null;
-  const getSearchParam = (name) => {
-    if (!searchParams) {
-      searchParams = new URLSearchParams(urlParts[1] || '');
-    }
-    return searchParams.get(name);
-  };
+  // 2. GET Method
+  if (req.method === 'GET') {
+    const dnsParam = searchParams.get('dns');
+    const nameParam = searchParams.get('name');
+    const typeParam = (searchParams.get('type') || 'A').toUpperCase();
 
-  const clientIp = req.headers['x-forwarded-for']
-    ? req.headers['x-forwarded-for'].split(',')[0].trim()
-    : (req.socket ? req.socket.remoteAddress : '127.0.0.1');
-
-  // RFC 8484 DoH Query Handler
-  if (pathname === '/dns-query' || pathname === '/resolve' || pathname.endsWith('/dns-query')) {
-    if (req.method === 'GET') {
-      const dnsParam = getSearchParam('dns');
-      const nameParam = getSearchParam('name');
-      const typeParam = (getSearchParam('type') || 'A').toUpperCase();
-
-      // 1. Standard RFC 8484 GET (?dns=<base64url>)
-      if (dnsParam) {
-        try {
-          const queryBuffer = base64urlDecode(dnsParam);
-          const responseBuffer = await handleDoH(queryBuffer, clientIp);
-          res.writeHead(200, {
-            'Content-Type': 'application/dns-message',
-            'Content-Length': responseBuffer.length,
-            'Cache-Control': 'public, max-age=60, s-maxage=300, stale-while-revalidate=86400'
-          });
-          res.end(responseBuffer);
-        } catch (err) {
-          res.writeHead(500, { 'Content-Type': 'text/plain' });
-          res.end('DoH Resolution Error: ' + err.message);
-        }
-        return;
-      }
-
-      // 2. JSON DoH Query (?name=<domain>&type=<type>)
-      if (nameParam) {
-        try {
-          const queryPacket = dnsPacket.encode({
-            type: 'query',
-            id: Math.floor(Math.random() * 65535) + 1,
-            flags: dnsPacket.RECURSION_DESIRED,
-            questions: [{ type: typeParam, name: nameParam.trim() }]
-          });
-
-          const startTime = Date.now();
-          const responseBuffer = await handleDoH(queryPacket, clientIp);
-          const latency = Date.now() - startTime;
-          const decoded = dnsPacket.decode(responseBuffer);
-
-          res.writeHead(200, {
-            'Content-Type': 'application/json; charset=utf-8',
-            'Cache-Control': 'public, max-age=60'
-          });
-          res.end(JSON.stringify({
-            Status: decoded.rcode === 'NOERROR' ? 0 : 2,
-            rcode: decoded.rcode || 'NOERROR',
-            TC: decoded.flag_tc || false,
-            RD: decoded.flag_rd || true,
-            RA: decoded.flag_ra || true,
-            Question: (decoded.questions || []).map(q => ({ name: q.name, type: q.type })),
-            Answer: (decoded.answers || []).map(a => ({
-              name: a.name,
-              type: a.type,
-              TTL: a.ttl || 300,
-              data: a.data || (a.ip ? a.ip : '')
-            })),
-            latencyMs: latency
-          }, null, 2));
-        } catch (err) {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ Status: 2, error: err.message }));
-        }
-        return;
-      }
-
-      // 3. User accesses /dns-query directly in browser without parameters
-      const host = req.headers.host || 'localhost:3000';
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({
-        status: 'online',
-        server: 'Antigravity Hyper-Speed DoH Proxy (Vercel Optimized)',
-        endpoints: {
-          rfc8484_post: { method: 'POST', path: '/dns-query', contentType: 'application/dns-message' },
-          rfc8484_get: { method: 'GET', path: '/dns-query?dns=<base64url>' },
-          json_query: { method: 'GET', path: '/dns-query?name=<domain>&type=<type>' }
-        },
-        quickTest: `https://${host}/dns-query?name=google.com&type=A`
-      }, null, 2));
-      return;
-    } else if (req.method === 'POST') {
+    // 2.1 RFC 8484 GET (?dns=<base64url>)
+    if (dnsParam) {
       try {
-        const queryBuffer = await getRequestBody(req);
-        if (!queryBuffer || queryBuffer.length === 0) {
-          res.writeHead(400, { 'Content-Type': 'text/plain' });
-          res.end('Empty query body');
-          return;
-        }
-
+        const queryBuffer = base64urlDecode(dnsParam);
         const responseBuffer = await handleDoH(queryBuffer, clientIp);
         res.writeHead(200, {
           'Content-Type': 'application/dns-message',
@@ -676,79 +606,249 @@ const handler = async (req, res) => {
         });
         res.end(responseBuffer);
       } catch (err) {
-        res.writeHead(500, { 'Content-Type': 'text/plain' });
-        res.end('DoH POST Error: ' + err.message);
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Invalid base64url DNS query: ' + err.message);
       }
       return;
     }
-  }
 
-  // Interactive Live DoH Tester API
-  if (pathname === '/api/test-doh') {
-    const name = getSearchParam('name') || 'google.com';
-    const type = (getSearchParam('type') || 'A').toUpperCase();
+    // 2.2 JSON DoH Query (?name=<domain>&type=<type>)
+    if (nameParam) {
+      try {
+        const queryPacket = dnsPacket.encode({
+          type: 'query',
+          id: Math.floor(Math.random() * 65535) + 1,
+          flags: dnsPacket.RECURSION_DESIRED,
+          questions: [{ type: typeParam, name: nameParam.trim() }]
+        });
 
-    try {
-      const queryPacket = dnsPacket.encode({
-        type: 'query',
-        id: Math.floor(Math.random() * 65535) + 1,
-        flags: dnsPacket.RECURSION_DESIRED,
-        questions: [{ type, name: name.trim() }]
-      });
+        const startTime = Date.now();
+        const responseBuffer = await handleDoH(queryPacket, clientIp);
+        const latency = Date.now() - startTime;
+        const decoded = dnsPacket.decode(responseBuffer);
 
-      const startTime = Date.now();
-      const responseBuffer = await handleDoH(queryPacket, clientIp);
-      const latency = Date.now() - startTime;
-      const decoded = dnsPacket.decode(responseBuffer);
-
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({
-        success: true,
-        query: { name, type },
-        latencyMs: latency,
-        rcode: decoded.rcode || 'NOERROR',
-        answersCount: (decoded.answers || []).length,
-        answers: decoded.answers || [],
-        base64UrlResponse: responseBuffer.toString('base64url'),
-        timestamp: new Date().toISOString()
-      }, null, 2));
-    } catch (err) {
-      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ success: false, error: err.message }));
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'public, max-age=60'
+        });
+        res.end(JSON.stringify({
+          Status: decoded.rcode === 'NOERROR' ? 0 : 2,
+          rcode: decoded.rcode || 'NOERROR',
+          TC: decoded.flag_tc || false,
+          RD: decoded.flag_rd || true,
+          RA: decoded.flag_ra || true,
+          Question: (decoded.questions || []).map(q => ({ name: q.name, type: q.type })),
+          Answer: (decoded.answers || []).map(a => ({
+            name: a.name,
+            type: a.type,
+            TTL: a.ttl || 300,
+            data: a.data || (a.ip ? a.ip : '')
+          })),
+          latencyMs: latency
+        }, null, 2));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ Status: 2, error: err.message }));
+      }
+      return;
     }
-    return;
-  }
 
-  // JSON Metrics API
-  if (pathname === '/api/stats') {
-    const totalRouted = upstreamStates.reduce((acc, curr) => acc + (curr.routedQueries || 0), 0);
-    const activeUpstreams = upstreamStates.filter(s => s.status !== 'Offline').length;
+    // 2.3 Browser visit to /dns-query: Redirect to home page dashboard if requesting HTML
+    const acceptHeader = req.headers['accept'] || '';
+    if (acceptHeader.includes('text/html')) {
+      res.writeHead(302, { 'Location': '/' });
+      res.end();
+      return;
+    }
 
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    // Otherwise return JSON API endpoints info
+    const host = req.headers.host || 'localhost:3000';
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({
-      ...stats,
-      upstreams: upstreamStates,
-      poolSize: currentPoolSize,
-      cacheSize: cache.size,
-      uptime: process.uptime(),
-      runtime: isVercel ? 'Vercel Serverless' : 'Node.js Standalone',
-      loadBalancing: {
-        algorithm: 'Adaptive P2C & Hedged Racing',
-        activeUpstreams,
-        totalUpstreams: upstreamStates.length,
-        totalRouted
+      status: 'online',
+      server: 'Antigravity Hyper-Speed DoH Proxy',
+      endpoints: {
+        rfc8484_post: { method: 'POST', path: '/dns-query', contentType: 'application/dns-message' },
+        rfc8484_get: { method: 'GET', path: '/dns-query?dns=<base64url>' },
+        json_query: { method: 'GET', path: '/dns-query?name=<domain>&type=<type>' },
+        iosProfile: `https://${host}/profile.mobileconfig`
       },
-      recentQueries
-    }));
+      quickTest: `https://${host}/dns-query?name=google.com&type=A`
+    }, null, 2));
     return;
   }
 
-  // HTML Web Dashboard (Default Route)
-  const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3000';
-  const protocol = req.headers['x-forwarded-proto'] || (isVercel ? 'https' : 'http');
-  const dohUrl = `${protocol}://${host}/dns-query`;
+  res.writeHead(405, { 'Content-Type': 'text/plain' });
+  res.end('Method Not Allowed');
+}
 
-  const html = `<!DOCTYPE html>
+// Ping / Health Check Handler
+function handlePingRequest(req, res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/plain',
+    'Cache-Control': 'no-store, no-cache, must-revalidate',
+    'Access-Control-Allow-Origin': '*'
+  });
+  res.end('pong');
+}
+
+// Stats Handler
+function handleStatsRequest(req, res) {
+  res.writeHead(200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*'
+  });
+  res.end(JSON.stringify({
+    totalQueries: stats.totalQueries,
+    cacheHits: stats.cacheHits,
+    cacheMisses: stats.cacheMisses,
+    swrHits: stats.swrHits,
+    errors: stats.errors,
+    averageLatency: stats.averageLatency,
+    poolSize: currentPoolSize,
+    cacheSize: cache.size,
+    upstreams: upstreamStates.map(u => ({
+      name: u.name,
+      ip: u.ip,
+      dohUrl: u.dohUrl,
+      avgLatency: u.avgLatency,
+      realAvgLatency: u.realAvgLatency || u.avgLatency,
+      penalty: u.penalty,
+      routedQueries: u.routedQueries || 0,
+      activeQueries: u.activeQueries || 0,
+      status: u.status
+    })),
+    recentQueries: recentQueries
+  }, null, 2));
+}
+
+// Interactive Live DoH Tester Handler
+async function handleTestDoHRequest(req, res) {
+  const urlParts = (req.url || '/').split('?');
+  const searchParams = new URLSearchParams(urlParts[1] || '');
+  const name = searchParams.get('name') || 'google.com';
+  const type = (searchParams.get('type') || 'A').toUpperCase();
+
+  const clientIp = req.headers['x-forwarded-for']
+    ? req.headers['x-forwarded-for'].split(',')[0].trim()
+    : '127.0.0.1';
+
+  try {
+    const queryPacket = dnsPacket.encode({
+      type: 'query',
+      id: Math.floor(Math.random() * 65535) + 1,
+      flags: dnsPacket.RECURSION_DESIRED,
+      questions: [{ type, name: name.trim() }]
+    });
+
+    const t0 = Date.now();
+    const responseBuffer = await handleDoH(queryPacket, clientIp);
+    const latency = Date.now() - t0;
+    const decoded = dnsPacket.decode(responseBuffer);
+
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Access-Control-Allow-Origin': '*'
+    });
+    res.end(JSON.stringify({
+      success: true,
+      domain: name,
+      type,
+      latencyMs: latency,
+      rcode: decoded.rcode || 'NOERROR',
+      answers: (decoded.answers || []).map(a => ({
+        name: a.name,
+        type: a.type,
+        ttl: a.ttl || 300,
+        data: a.data || (a.ip ? a.ip : '')
+      }))
+    }, null, 2));
+  } catch (err) {
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Access-Control-Allow-Origin': '*'
+    });
+    res.end(JSON.stringify({
+      success: false,
+      domain: name,
+      type,
+      error: err.message
+    }));
+  }
+}
+
+// Apple iOS / macOS Encrypted DNS Profile (.mobileconfig)
+function generateMobileConfig(host = 'localhost:3000') {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>DNSSettings</key>
+            <dict>
+                <key>DNSProtocol</key>
+                <string>HTTPS</string>
+                <key>ServerURL</key>
+                <string>https://${host}/dns-query</string>
+            </dict>
+            <key>PayloadDescription</key>
+            <string>Cau hinh DNS over HTTPS bao mat va toc do cao</string>
+            <key>PayloadDisplayName</key>
+            <string>Antigravity DoH (${host})</string>
+            <key>PayloadIdentifier</key>
+            <string>com.antigravity.dns.${host}</string>
+            <key>PayloadType</key>
+            <string>com.apple.dnsSettings.managed</string>
+            <key>PayloadUUID</key>
+            <string>3B7A849F-9D45-42EB-8B7A-72534591ABCD</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>ProhibitDisablement</key>
+            <false/>
+        </dict>
+    </array>
+    <key>PayloadDescription</key>
+    <string>May chu DNS over HTTPS toc do cao toi uu hoa Vercel</string>
+    <key>PayloadDisplayName</key>
+    <string>Antigravity DoH Proxy</string>
+    <key>PayloadIdentifier</key>
+    <string>com.antigravity.dns.profile.${host}</string>
+    <key>PayloadRemovalDisallowed</key>
+    <false/>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadUUID</key>
+    <string>A51B7610-82E5-46D9-B101-92CD8E591234</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+</dict>
+</plist>`;
+}
+
+function handleProfileRequest(req, res) {
+  const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3000';
+  const xml = generateMobileConfig(host);
+  res.writeHead(200, {
+    'Content-Type': 'application/x-apple-aspen-config; charset=utf-8',
+    'Content-Disposition': 'attachment; filename="Antigravity-DoH.mobileconfig"',
+    'Cache-Control': 'no-cache',
+    'Access-Control-Allow-Origin': '*'
+  });
+  res.end(xml);
+}
+
+// -------------------------------------------------------------
+// WEB DASHBOARD HTML
+// -------------------------------------------------------------
+function renderDashboardHtml(req) {
+  const host = req.headers['x-forwarded-host'] || req.headers.host || `localhost:${PORT}`;
+  const dohUrl = `https://${host}/dns-query`;
+  const mobileConfigUrl = `https://${host}/profile.mobileconfig`;
+
+  return `<!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
@@ -758,252 +858,496 @@ const handler = async (req, res) => {
     <style>
         :root {
             --bg-color: #03050a;
-            --panel-bg: rgba(8, 12, 24, 0.75);
-            --border-color: rgba(255, 255, 255, 0.06);
-            --accent-glow: linear-gradient(135deg, #00f2fe 0%, #4facfe 100%);
-            --accent-solid: #00f2fe;
-            --text-color: #f3f4f6;
-            --text-muted: #9ca3af;
-            --color-healthy: #00ffaa;
-            --color-warning: #ffb800;
-            --color-offline: #ff3b30;
+            --surface-color: #0d111a;
+            --surface-card: #131926;
+            --surface-border: #1e293b;
+            --primary: #38bdf8;
+            --primary-hover: #0ea5e9;
+            --accent: #818cf8;
+            --text-main: #f1f5f9;
+            --text-muted: #94a3b8;
+            --color-healthy: #34d399;
+            --color-warning: #fbbf24;
+            --color-danger: #f87171;
+            --font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
         }
+
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
-            font-family: 'Outfit', sans-serif;
             background-color: var(--bg-color);
-            color: var(--text-color);
+            color: var(--text-main);
+            font-family: var(--font-family);
             min-height: 100vh;
-            overflow-x: hidden;
-            background-image: 
-                radial-gradient(circle at 15% 15%, rgba(0, 242, 254, 0.06) 0%, transparent 35%),
-                radial-gradient(circle at 85% 85%, rgba(79, 172, 254, 0.06) 0%, transparent 35%);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 30px 15px;
         }
-        .container { max-width: 1200px; margin: 0 auto; padding: 40px 20px; }
-        header { text-align: center; margin-bottom: 35px; }
-        header h1 {
-            font-size: 2.8rem;
+
+        .container {
+            width: 100%;
+            max-width: 1100px;
+            display: flex;
+            flex-direction: column;
+            gap: 25px;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 15px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid var(--surface-border);
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .brand-icon {
+            width: 50px;
+            height: 50px;
+            background: linear-gradient(135deg, #38bdf8, #818cf8);
+            border-radius: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 26px;
+            box-shadow: 0 0 25px rgba(56, 189, 248, 0.4);
+        }
+
+        .brand-text h1 {
+            font-size: 1.6rem;
             font-weight: 800;
-            background: linear-gradient(to right, #00f2fe, #4facfe);
+            background: linear-gradient(90deg, #38bdf8, #818cf8, #c084fc);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
-            margin-bottom: 8px;
-            letter-spacing: -0.5px;
         }
-        header p { color: var(--text-muted); font-size: 1.1rem; font-weight: 300; }
-        .badge-vercel {
-            display: inline-flex; align-items: center; gap: 6px;
-            padding: 6px 14px; border-radius: 20px;
-            background: rgba(0, 242, 254, 0.12); border: 1px solid rgba(0, 242, 254, 0.3);
-            color: var(--accent-solid); font-size: 0.85rem; font-weight: 600;
-            margin-top: 12px;
+
+        .brand-text p {
+            font-size: 0.85rem;
+            color: var(--text-muted);
         }
-        .grid-stats {
+
+        .badge-live {
+            background: rgba(52, 211, 153, 0.12);
+            color: var(--color-healthy);
+            border: 1px solid rgba(52, 211, 153, 0.3);
+            padding: 6px 14px;
+            border-radius: 9999px;
+            font-size: 0.85rem;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .pulse-dot {
+            width: 8px;
+            height: 8px;
+            background-color: var(--color-healthy);
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 8px rgba(52, 211, 153, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(52, 211, 153, 0); }
+        }
+
+        /* 1-Click iOS Quick Install Banner */
+        .ios-banner {
+            background: linear-gradient(135deg, rgba(56, 189, 248, 0.15), rgba(129, 140, 248, 0.1));
+            border: 1px solid rgba(56, 189, 248, 0.35);
+            border-radius: 16px;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+        }
+
+        .ios-banner-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .ios-banner-title {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .btn-ios {
+            background: linear-gradient(135deg, #38bdf8, #6366f1);
+            color: #fff;
+            padding: 12px 24px;
+            border-radius: 10px;
+            font-weight: 700;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 1rem;
+            box-shadow: 0 4px 15px rgba(56, 189, 248, 0.35);
+            transition: all 0.2s ease;
+        }
+
+        .btn-ios:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(56, 189, 248, 0.5);
+        }
+
+        .steps-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 15px;
+            margin-top: 5px;
+        }
+
+        .step-item {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 10px;
+            padding: 14px;
+            font-size: 0.88rem;
+            color: var(--text-muted);
+        }
+
+        .step-item strong {
+            color: #fff;
+            display: block;
+            margin-bottom: 5px;
+        }
+
+        /* URL Card */
+        .url-card {
+            background: var(--surface-card);
+            border: 1px solid var(--surface-border);
+            border-radius: 16px;
+            padding: 22px;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+
+        .url-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .url-card-header h2 {
+            font-size: 1.15rem;
+            font-weight: 700;
+            color: #fff;
+        }
+
+        .url-box {
+            background: #080c14;
+            border: 1px solid #1e293b;
+            border-radius: 10px;
+            padding: 14px 18px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+            font-family: monospace;
+            font-size: 1.05rem;
+            color: var(--primary);
+            overflow-x: auto;
+        }
+
+        .btn-copy {
+            background: rgba(56, 189, 248, 0.15);
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            color: var(--primary);
+            padding: 8px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 0.85rem;
+            white-space: nowrap;
+            transition: all 0.2s;
+        }
+
+        .btn-copy:hover {
+            background: var(--primary);
+            color: #000;
+        }
+
+        /* Stats Grid */
+        .stats-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 18px; margin-bottom: 30px;
+            gap: 15px;
         }
+
         .stat-card {
-            background: var(--panel-bg);
-            border: 1px solid var(--border-color);
-            backdrop-filter: blur(20px);
-            border-radius: 18px; padding: 20px;
-            transition: all 0.25s ease;
+            background: var(--surface-card);
+            border: 1px solid var(--surface-border);
+            border-radius: 14px;
+            padding: 18px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
         }
-        .stat-card:hover {
-            transform: translateY(-3px);
-            border-color: rgba(0, 242, 254, 0.25);
-            box-shadow: 0 10px 25px rgba(0, 242, 254, 0.05);
+
+        .stat-label {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            font-weight: 600;
         }
-        .stat-title { color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
-        .stat-value { font-size: 1.8rem; font-weight: 700; font-variant-numeric: tabular-nums; }
-        .stat-unit { font-size: 0.8rem; color: var(--text-muted); font-weight: 400; margin-left: 2px; }
+
+        .stat-value {
+            font-size: 1.7rem;
+            font-weight: 800;
+            color: #fff;
+        }
+
+        .stat-unit {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            font-weight: normal;
+            margin-left: 4px;
+        }
+
+        /* Main Panels */
         .main-panel {
-            background: var(--panel-bg);
-            border: 1px solid var(--border-color);
-            backdrop-filter: blur(20px);
-            border-radius: 22px; padding: 30px; margin-bottom: 30px;
+            background: var(--surface-card);
+            border: 1px solid var(--surface-border);
+            border-radius: 16px;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 18px;
         }
+
         .main-panel h2 {
-            font-size: 1.35rem; margin-bottom: 18px; font-weight: 700;
-            display: flex; align-items: center; gap: 10px;
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: #fff;
         }
-        .main-panel h2::before {
-            content: ''; display: inline-block; width: 5px; height: 20px;
-            background: var(--accent-glow); border-radius: 3px;
+
+        /* Tester Component */
+        .tester-bar {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
         }
-        .url-box {
-            background: rgba(0, 0, 0, 0.4);
-            border: 1px solid rgba(0, 242, 254, 0.25);
-            border-radius: 12px; padding: 14px 18px;
-            display: flex; justify-content: space-between; align-items: center;
-            font-family: monospace; font-size: 0.95rem; color: var(--accent-solid);
-            margin-bottom: 20px; word-break: break-all;
+
+        .tester-input {
+            flex: 1;
+            min-width: 200px;
+            background: #080c14;
+            border: 1px solid #1e293b;
+            border-radius: 8px;
+            padding: 12px 16px;
+            color: #fff;
+            font-size: 0.95rem;
+            font-family: inherit;
         }
-        .btn-copy {
-            background: var(--accent-glow); color: #000;
-            border: none; padding: 8px 16px; border-radius: 8px;
-            font-weight: 700; cursor: pointer; transition: all 0.2s;
-            margin-left: 12px; white-space: nowrap;
+
+        .tester-input:focus {
+            outline: none;
+            border-color: var(--primary);
         }
-        .btn-copy:hover { transform: scale(1.05); }
-        .deploy-guide-box {
-            background: linear-gradient(135deg, rgba(0, 242, 254, 0.05), rgba(79, 172, 254, 0.02));
-            border: 1px solid rgba(0, 242, 254, 0.2);
-            border-radius: 16px; padding: 22px; margin-bottom: 25px;
+
+        .tester-select {
+            background: #080c14;
+            border: 1px solid #1e293b;
+            border-radius: 8px;
+            padding: 12px 16px;
+            color: #fff;
+            font-size: 0.95rem;
         }
-        .deploy-steps {
-            display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-            gap: 15px; margin-top: 15px;
+
+        .btn-test {
+            background: linear-gradient(135deg, var(--primary), var(--accent));
+            border: none;
+            color: #fff;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: opacity 0.2s;
         }
-        .deploy-step {
-            background: rgba(0, 0, 0, 0.3); border: 1px solid var(--border-color);
-            border-radius: 12px; padding: 15px;
+
+        .btn-test:hover {
+            opacity: 0.9;
         }
-        .deploy-step h4 {
-            color: var(--accent-solid); font-size: 0.95rem; margin-bottom: 6px;
-            display: flex; align-items: center; gap: 6px;
+
+        .test-result-box {
+            background: #080c14;
+            border: 1px solid #1e293b;
+            border-radius: 8px;
+            padding: 16px;
+            font-family: monospace;
+            font-size: 0.88rem;
+            white-space: pre-wrap;
+            display: none;
         }
-        .deploy-step p { color: var(--text-muted); font-size: 0.85rem; line-height: 1.4; }
-        .table-container { width: 100%; overflow-x: auto; }
-        table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.9rem; }
+
+        /* Table */
+        .table-container {
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+            font-size: 0.9rem;
+        }
+
         th {
-            padding: 12px 14px; border-bottom: 2px solid var(--border-color);
-            color: var(--text-muted); font-weight: 600; text-transform: uppercase; font-size: 0.75rem;
+            padding: 12px 14px;
+            border-bottom: 2px solid var(--surface-border);
+            color: var(--text-muted);
+            font-weight: 600;
         }
-        td { padding: 14px; border-bottom: 1px solid var(--border-color); vertical-align: middle; }
-        tr:hover td { background: rgba(255, 255, 255, 0.02); }
+
+        td {
+            padding: 12px 14px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            color: var(--text-main);
+        }
+
         .status-dot {
-            width: 8px; height: 8px; border-radius: 50%;
-            display: inline-block; margin-right: 6px;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 6px;
         }
-        .status-Healthy { background: var(--color-healthy); box-shadow: 0 0 8px var(--color-healthy); }
-        .status-Warning { background: var(--color-warning); box-shadow: 0 0 8px var(--color-warning); }
-        .status-Offline { background: var(--color-offline); box-shadow: 0 0 8px var(--color-offline); }
+
+        .status-Healthy { background: var(--color-healthy); }
+        .status-Degraded { background: var(--color-warning); }
+        .status-Offline { background: var(--color-danger); }
+
         .badge-winner {
-            background: rgba(0, 242, 254, 0.12); color: var(--accent-solid);
-            border: 1px solid rgba(0, 242, 254, 0.25);
-            padding: 2px 8px; border-radius: 6px; font-size: 0.75rem; font-weight: 600;
+            background: rgba(56, 189, 248, 0.15);
+            color: var(--primary);
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 700;
         }
     </style>
 </head>
 <body>
     <div class="container">
+        <!-- Header -->
         <header>
-            <h1>Antigravity Hyper-Speed DoH Proxy</h1>
-            <p>Hệ thống DNS over HTTPS tốc độ cao — Tối ưu hóa 100% cho Vercel & Node.js</p>
-            <div class="badge-vercel">
-                <span>⚡</span>
-                <span>Vercel Serverless Ready — Zero Freeze & Zero Latency Spikes</span>
+            <div class="brand">
+                <div class="brand-icon">⚡</div>
+                <div class="brand-text">
+                    <h1>Antigravity DoH Proxy</h1>
+                    <p>Máy chủ DNS-over-HTTPS tốc độ cao — Phân tán đa Upstream</p>
+                </div>
+            </div>
+            <div class="badge-live">
+                <div class="pulse-dot"></div>
+                Vercel Serverless Ready
             </div>
         </header>
 
-        <div class="deploy-guide-box">
-            <h3 style="display: flex; align-items: center; gap: 8px; color: #fff; font-size: 1.15rem;">
-                <span>🚀</span> Hướng dẫn đẩy lên Vercel chạy thực tế 24/7 (Miễn phí 100%)
-            </h3>
-            <p style="color: var(--text-muted); font-size: 0.9rem; margin-top: 6px;">
-                Hệ thống đã được tối ưu hoàn toàn cho Vercel: sử dụng Keep-Alive HTTPS DoH upstreams, cấu hình <code>vercel.json</code> serverless rewrites, không còn phụ thuộc vào socket UDP bị chặn trên cloud.
-            </p>
-            <div class="deploy-steps">
-                <div class="deploy-step">
-                    <h4>1. Đẩy code lên GitHub</h4>
-                    <p>Commit và push toàn bộ thư mục này lên GitHub repository của bạn (vd: <code>git push origin main</code>).</p>
+        <!-- 1-Click iOS Quick Install Profile -->
+        <div class="ios-banner">
+            <div class="ios-banner-header">
+                <div class="ios-banner-title">
+                    <span>📱</span>
+                    <span>Cài đặt 1-chạm cho iPhone, iPad & Mac (Khắc phục 100% lỗi mạng)</span>
                 </div>
-                <div class="deploy-step">
-                    <h4>2. Kết nối vào Vercel</h4>
-                    <p>Truy cập <strong>vercel.com</strong> &rarr; Click <strong>"Add New... Project"</strong> &rarr; Chọn repo GitHub của bạn.</p>
+                <a href="${mobileConfigUrl}" class="btn-ios" download="Antigravity-DoH.mobileconfig">
+                    📥 Tải Profile iOS (.mobileconfig)
+                </a>
+            </div>
+            <div class="steps-container">
+                <div class="step-item">
+                    <strong>1. Tải về qua Safari</strong>
+                    Bấm nút "Tải Profile iOS" phía trên (dùng Safari trên iPhone). Chọn "Cho phép" khi có thông báo tải hồ sơ.
                 </div>
-                <div class="deploy-step">
-                    <h4>3. Nhấn Deploy</h4>
-                    <p>Không cần cấu hình biến môi trường nào! Nhấn <strong>Deploy</strong>. Vercel sẽ tự sinh domain <code>https://&lt;ten-du-an&gt;.vercel.app</code>.</p>
+                <div class="step-item">
+                    <strong>2. Mở Cài đặt iPhone</strong>
+                    Vào <em>Cài đặt</em> ➔ bấm dòng <em>"Đã tải về hồ sơ"</em> (hoặc <em>Cài đặt chung ➔ Quản lý VPN & Thiết bị</em>).
                 </div>
-                <div class="deploy-step">
-                    <h4>4. Cài đặt vào thiết bị</h4>
-                    <p>URL DoH của bạn sẽ là <code>https://&lt;ten-du-an&gt;.vercel.app/dns-query</code>. Dán vào iPhone, Android, Windows 11 hoặc trình duyệt để dùng internet tốc độ cao!</p>
+                <div class="step-item">
+                    <strong>3. Bấm Cài đặt</strong>
+                    Bấm <em>Cài đặt</em> ở góc phải trên. Hoàn tất! Toàn bộ máy sẽ tự động sử dụng DoH bảo mật, không cần cài bất kỳ ứng dụng nào.
                 </div>
             </div>
         </div>
 
-        <div class="grid-stats">
-            <div class="stat-card">
-                <div class="stat-title">Tổng truy vấn</div>
-                <div class="stat-value" id="total-queries">0</div>
+        <!-- URL Configuration Card -->
+        <div class="url-card">
+            <div class="url-card-header">
+                <h2>🌐 Địa chỉ DoH RFC 8484 (Cài đặt thủ công)</h2>
+                <span style="font-size: 0.85rem; color: var(--text-muted);">Hỗ trợ GET / POST RFC 8484 & JSON</span>
             </div>
-            <div class="stat-card">
-                <div class="stat-title">Cache RAM (0ms)</div>
-                <div class="stat-value" id="cache-hit-rate">0<span class="stat-unit">%</span></div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-title">Tối ưu SWR Hits</div>
-                <div class="stat-value" id="swr-hits">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-title">Độ trễ trung bình</div>
-                <div class="stat-value" id="avg-latency">0<span class="stat-unit">ms</span></div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-title">Racing Pool</div>
-                <div class="stat-value" id="pool-size">3<span class="stat-unit">upstreams</span></div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-title">Ping của bạn đến Server</div>
-                <div class="stat-value" id="client-to-server-ping">--<span class="stat-unit">ms</span></div>
-            </div>
-        </div>
-
-        <div class="main-panel">
-            <h2>Đường dẫn DNS over HTTPS (DoH) của bạn</h2>
             <div class="url-box">
                 <span id="doh-url">${dohUrl}</span>
-                <button class="btn-copy" onclick="copyUrl()">Sao chép URL</button>
+                <button class="btn-copy" onclick="copyUrl('doh-url')">Sao chép</button>
             </div>
-            <div style="font-size: 0.85rem; color: var(--text-muted); display: flex; gap: 15px; flex-wrap: wrap;">
-                <span>✅ Hỗ trợ RFC 8484 Binary POST</span>
-                <span>✅ Hỗ trợ RFC 8484 Base64url GET (<code>?dns=</code>)</span>
-                <span>✅ Hỗ trợ JSON Query API (<code>?name=&amp;type=</code>)</span>
-                <span>✅ Tự động định tuyến Anycast CDN (ECS Injection)</span>
+            <div style="font-size: 0.85rem; color: var(--text-muted); display: flex; flex-direction: column; gap: 4px;">
+                <div>• <strong>Chrome / Edge / Firefox</strong>: Vào <em>Cài đặt</em> ➔ <em>Quyền riêng tư & Bảo mật</em> ➔ <em>Sử dụng DNS an toàn</em> ➔ Tùy chỉnh: dán URL trên vào.</div>
+                <div>• <strong>Android / App DNS (DNSCloak, Intra, AdGuard)</strong>: Dán URL <code>${dohUrl}</code> vào cấu hình DoH của ứng dụng.</div>
             </div>
         </div>
 
-        <!-- Interactive DoH Query Tester -->
+        <!-- Real-time Stats Grid -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <span class="stat-label">Tổng truy vấn</span>
+                <span class="stat-value" id="total-queries">0</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Tỷ lệ Trúng Cache (RAM)</span>
+                <span class="stat-value" id="cache-hit-rate">0<span class="stat-unit">%</span></span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Trúng Bộ Đệm SWR</span>
+                <span class="stat-value" id="swr-hits">0</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Độ trễ trung bình</span>
+                <span class="stat-value" id="avg-latency">0<span class="stat-unit">ms</span></span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Upstream Song Song</span>
+                <span class="stat-value" id="pool-size">4<span class="stat-unit">máy chủ</span></span>
+            </div>
+        </div>
+
+        <!-- Live DoH Query Tester -->
         <div class="main-panel">
-            <h2>🧪 Công cụ kiểm thử truy vấn DoH trực tiếp</h2>
-            <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px;">
-                <input id="test-domain-input" type="text" value="google.com" placeholder="Nhập tên miền (vd: facebook.com, vnexpress.net)" style="flex: 1; min-width: 200px; padding: 10px 14px; background: rgba(0,0,0,0.4); border: 1px solid var(--border-color); border-radius: 8px; color: #fff; font-family: monospace; outline: none;" onkeydown="if(event.key==='Enter') executeDoHTest()" />
-                <select id="test-type-select" style="padding: 10px 14px; background: #080c18; border: 1px solid var(--border-color); border-radius: 8px; color: #fff; font-weight: 600; cursor: pointer; outline: none;">
-                    <option value="A">Record A (IPv4)</option>
-                    <option value="AAAA">Record AAAA (IPv6)</option>
-                    <option value="MX">Record MX</option>
-                    <option value="TXT">Record TXT</option>
+            <h2>🧪 Kiểm thử truy vấn DoH trực tiếp</h2>
+            <div class="tester-bar">
+                <input type="text" id="test-domain-input" class="tester-input" placeholder="Nhập tên miền (ví dụ: google.com, apple.com, shopee.vn)" value="apple.com">
+                <select id="test-type-select" class="tester-select">
+                    <option value="A">A (IPv4)</option>
+                    <option value="AAAA">AAAA (IPv6)</option>
+                    <option value="TXT">TXT</option>
+                    <option value="MX">MX</option>
                 </select>
-                <button onclick="executeDoHTest()" style="background: var(--accent-glow); color: #000; border: none; padding: 10px 20px; border-radius: 8px; font-weight: 700; cursor: pointer;">Chạy truy vấn</button>
+                <button class="btn-test" onclick="executeDoHTest()">Gửi truy vấn DoH</button>
             </div>
-            <div id="test-result-box" style="display: none; background: rgba(0, 0, 0, 0.4); border: 1px solid rgba(0, 242, 254, 0.2); border-radius: 10px; padding: 15px; font-family: monospace; font-size: 0.85rem;">
-                <div id="test-result-meta" style="margin-bottom: 8px; color: var(--accent-solid); font-weight: 600;"></div>
-                <pre id="test-result-pre" style="white-space: pre-wrap; color: #e5e7eb;"></pre>
-            </div>
-        </div>
-
-        <!-- Live Load Balancing & Dispatch Logs -->
-        <div class="main-panel">
-            <h2>⚡ Nhật ký điều phối &amp; chia tải thời gian thực</h2>
-            <div class="table-container">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Thời gian</th>
-                            <th>Tên miền</th>
-                            <th>Loại</th>
-                            <th>Upstream thắng giải tải</th>
-                            <th>Độ trễ</th>
-                            <th>Trạng thái</th>
-                        </tr>
-                    </thead>
-                    <tbody id="query-logs-body">
-                        <tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 25px;">Đang tải nhật ký...</td></tr>
-                    </tbody>
-                </table>
+            <div id="test-result-box" class="test-result-box">
+                <div id="test-result-meta" style="color: var(--primary); margin-bottom: 8px; font-weight: 600;"></div>
+                <div id="test-result-pre"></div>
             </div>
         </div>
 
@@ -1030,30 +1374,13 @@ const handler = async (req, res) => {
     </div>
 
     <script>
-        function copyUrl() {
-            const urlText = document.getElementById('doh-url').innerText;
-            navigator.clipboard.writeText(urlText).then(() => {
-                alert('Đã sao chép URL DoH vào bộ nhớ tạm: ' + urlText);
+        function copyUrl(elementId) {
+            const text = document.getElementById(elementId).innerText;
+            navigator.clipboard.writeText(text).then(() => {
+                alert('Đã sao chép URL: ' + text);
             }).catch(() => {
-                const input = document.createElement('input');
-                input.value = urlText;
-                document.body.appendChild(input);
-                input.select();
-                document.execCommand('copy');
-                document.body.removeChild(input);
-                alert('Đã sao chép URL DoH!');
+                prompt('Sao chép đường dẫn này:', text);
             });
-        }
-
-        async function pingServer() {
-            const t0 = performance.now();
-            try {
-                const res = await fetch('/api/ping?t=' + Date.now(), { cache: 'no-store' });
-                if (res.ok) {
-                    const rtt = Math.round(performance.now() - t0);
-                    document.getElementById('client-to-server-ping').innerHTML = rtt + '<span class="stat-unit">ms</span>';
-                }
-            } catch (e) {}
         }
 
         async function fetchStats() {
@@ -1061,15 +1388,13 @@ const handler = async (req, res) => {
                 const res = await fetch('/api/stats');
                 if (!res.ok) return;
                 const data = await res.json();
-
                 document.getElementById('total-queries').innerText = data.totalQueries.toLocaleString();
                 const hitRate = data.totalQueries > 0 ? Math.round((data.cacheHits / data.totalQueries) * 100) : 0;
                 document.getElementById('cache-hit-rate').innerHTML = hitRate + '<span class="stat-unit">%</span>';
                 document.getElementById('swr-hits').innerText = (data.swrHits || 0).toLocaleString();
                 document.getElementById('avg-latency').innerHTML = (data.averageLatency || 0) + '<span class="stat-unit">ms</span>';
-                document.getElementById('pool-size').innerHTML = (data.poolSize || 3) + '<span class="stat-unit">upstreams</span>';
+                document.getElementById('pool-size').innerHTML = (data.poolSize || 4) + '<span class="stat-unit">máy chủ</span>';
 
-                // Upstreams table
                 const tbody = document.getElementById('dns-table-body');
                 if (data.upstreams && data.upstreams.length > 0) {
                     tbody.innerHTML = data.upstreams.map(u => {
@@ -1080,22 +1405,6 @@ const handler = async (req, res) => {
                             '<td><span style="color: ' + (isHealthy ? 'var(--color-healthy)' : 'var(--color-warning)') + '; font-weight: 700;">' + (u.realAvgLatency || u.avgLatency || 20) + ' ms</span></td>' +
                             '<td><span class="status-dot status-' + u.status + '"></span>' + u.status + '</td>' +
                             '<td><span class="badge-winner">' + (u.routedQueries || 0) + ' truy vấn</span></td>' +
-                        '</tr>';
-                    }).join('');
-                }
-
-                // Recent queries log
-                const logBody = document.getElementById('query-logs-body');
-                if (data.recentQueries && data.recentQueries.length > 0) {
-                    logBody.innerHTML = data.recentQueries.map(q => {
-                        const timeStr = new Date(q.timestamp).toLocaleTimeString();
-                        return '<tr>' +
-                            '<td style="color: var(--text-muted); font-size: 0.8rem;">' + timeStr + '</td>' +
-                            '<td><code style="color: #fff; font-weight: 600;">' + escapeHtml(q.domain) + '</code></td>' +
-                            '<td><span style="font-size: 0.75rem; padding: 2px 6px; background: rgba(255,255,255,0.06); border-radius: 4px;">' + escapeHtml(q.type) + '</span></td>' +
-                            '<td><span class="badge-winner">' + escapeHtml(q.upstreamName) + '</span></td>' +
-                            '<td style="font-weight: 600; color: ' + (q.latency < 25 ? 'var(--color-healthy)' : 'var(--color-warning)') + ';">' + q.latency + ' ms</td>' +
-                            '<td><span style="color: var(--color-healthy); font-size: 0.8rem;">● ' + escapeHtml(q.status) + '</span></td>' +
                         '</tr>';
                     }).join('');
                 }
@@ -1141,15 +1450,69 @@ const handler = async (req, res) => {
         }
 
         fetchStats();
-        pingServer();
-        setInterval(fetchStats, 3000);
-        setInterval(pingServer, 5000);
+        setInterval(fetchStats, 4000);
     </script>
 </body>
 </html>`;
+}
 
+// -------------------------------------------------------------
+// CENTRAL ROUTE HANDLER (Supports Direct Node & Vercel Serverless)
+// -------------------------------------------------------------
+const handler = async (req, res) => {
+  const urlParts = (req.url || '/').split('?');
+  const searchParams = new URLSearchParams(urlParts[1] || '');
+
+  // Resolve actual requested path across Vercel Rewrites and direct invocations
+  let pathname = urlParts[0];
+  if (pathname === '/api/index' || pathname === '/api') {
+    if (searchParams.has('path')) {
+      pathname = searchParams.get('path');
+    } else if (req.headers['x-matched-path']) {
+      pathname = req.headers['x-matched-path'];
+    } else if (req.headers['x-forwarded-uri']) {
+      pathname = req.headers['x-forwarded-uri'].split('?')[0];
+    } else if (req.headers['x-invoke-path']) {
+      pathname = req.headers['x-invoke-path'];
+    }
+  }
+
+  // 1. Detect if incoming request is a DoH request (Strictly prevents sending HTML to DNS clients)
+  const isDnsContentType = (req.headers['content-type'] || '').toLowerCase().includes('application/dns-message') ||
+                           (req.headers['accept'] || '').toLowerCase().includes('application/dns-message');
+  const isDnsPath = pathname === '/dns-query' ||
+                    pathname === '/resolve' ||
+                    pathname.endsWith('/dns-query') ||
+                    pathname === '/api/dns-query';
+  const hasDnsParams = (searchParams.has('dns') || searchParams.has('name')) && pathname !== '/api/test-doh';
+
+  if (isDnsPath || isDnsContentType || (hasDnsParams && req.method === 'GET')) {
+    return handleDoHRequest(req, res);
+  }
+
+  // 2. Health check
+  if (pathname === '/api/ping') {
+    return handlePingRequest(req, res);
+  }
+
+  // 3. Stats
+  if (pathname === '/api/stats') {
+    return handleStatsRequest(req, res);
+  }
+
+  // 4. Test DoH
+  if (pathname === '/api/test-doh') {
+    return handleTestDoHRequest(req, res);
+  }
+
+  // 5. Apple iOS/macOS Encrypted DNS Profile (.mobileconfig)
+  if (pathname === '/profile.mobileconfig' || pathname === '/api/profile') {
+    return handleProfileRequest(req, res);
+  }
+
+  // 6. Default: Serve Web Dashboard
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-  res.end(html);
+  res.end(renderDashboardHtml(req));
 };
 
 const server = http.createServer(handler);
@@ -1167,16 +1530,26 @@ const cleanupTimer = setInterval(() => {
 }, 120000);
 if (cleanupTimer.unref) cleanupTimer.unref();
 
-// Periodic update of candidate rankings
+// Periodic candidate ranking
 const candidatesTimer = setInterval(updateCandidates, 8000);
 if (candidatesTimer.unref) candidatesTimer.unref();
 
-// In standalone Node.js environment, listen on PORT
+// Standalone Node.js execution
 if (!isVercel && require.main === module) {
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`[Antigravity DNS] Server listening on http://0.0.0.0:${PORT}`);
   });
 }
 
-module.exports = { server, handler };
+module.exports = {
+  server,
+  handler,
+  handleDoHRequest,
+  handlePingRequest,
+  handleStatsRequest,
+  handleTestDoHRequest,
+  handleProfileRequest,
+  generateMobileConfig,
+  handleDoH
+};
 module.exports.default = handler;

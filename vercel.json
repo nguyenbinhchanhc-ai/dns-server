@@ -2,19 +2,51 @@
   "version": 2,
   "rewrites": [
     {
+      "source": "/dns-query",
+      "destination": "/api/dns-query"
+    },
+    {
+      "source": "/resolve",
+      "destination": "/api/dns-query"
+    },
+    {
+      "source": "/profile.mobileconfig",
+      "destination": "/api/profile"
+    },
+    {
+      "source": "/api/ping",
+      "destination": "/api/ping"
+    },
+    {
+      "source": "/api/stats",
+      "destination": "/api/stats"
+    },
+    {
+      "source": "/api/test-doh",
+      "destination": "/api/test-doh"
+    },
+    {
       "source": "/(.*)",
-      "destination": "/api/index"
+      "destination": "/api/index?path=/$1"
     }
   ],
   "headers": [
     {
       "source": "/(.*)",
       "headers": [
-        { "key": "Access-Control-Allow-Origin", "value": "*" },
-        { "key": "Access-Control-Allow-Methods", "value": "GET, POST, OPTIONS" },
-        { "key": "Access-Control-Allow-Headers", "value": "Content-Type" }
+        {
+          "key": "Access-Control-Allow-Origin",
+          "value": "*"
+        },
+        {
+          "key": "Access-Control-Allow-Methods",
+          "value": "GET, POST, OPTIONS"
+        },
+        {
+          "key": "Access-Control-Allow-Headers",
+          "value": "Content-Type, Accept, Cache-Control"
+        }
       ]
     }
   ]
 }
-
