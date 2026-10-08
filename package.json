@@ -1,10 +1,13 @@
 {
   "name": "render-doh-proxy",
   "version": "1.0.0",
-  "description": "High-performance DNS over HTTPS (DoH) proxy server for Render",
+  "description": "High-performance DNS over HTTPS (DoH) proxy server optimized for Vercel and Node.js",
   "main": "server.js",
   "scripts": {
+    "dev": "node server.js",
     "start": "node server.js",
+    "build": "echo 'Build complete'",
+    "lint": "node --check server.js test-client.js api/index.js",
     "test": "node test-client.js"
   },
   "dependencies": {
