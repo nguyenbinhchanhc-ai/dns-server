@@ -70,12 +70,15 @@ function updateCandidates() {
   }
 }
 
+const os = require('os');
+const path = require('path');
+
 // In-Memory Cache with Stale-While-Revalidate (SWR) & In-Flight Coalescing
 const cache = new Map();
 const coalescedQueries = new Map();
 const activeRevalidations = new Set();
 
-const STATS_FILE = '/tmp/antigravity_doh_stats.json';
+const STATS_FILE = path.join(os.tmpdir(), 'antigravity_doh_stats.json');
 
 const stats = {
   totalQueries: 0,
@@ -101,6 +104,7 @@ function recordRecentQuery(domain, type, upstreamName, upstreamIp, latency, stat
     status
   });
   if (recentQueries.length > 50) recentQueries.pop();
+  persistStats(true);
   broadcastStatsUpdate();
 }
 
@@ -148,9 +152,14 @@ function getStatsSnapshot() {
 }
 
 // Serverless State Persistence across Cold Starts & Invocations
+let lastStatsMtime = 0;
 function loadPersistedStats() {
   try {
     if (fs.existsSync(STATS_FILE)) {
+      const fileStat = fs.statSync(STATS_FILE);
+      if (fileStat.mtimeMs <= lastStatsMtime && lastStatsMtime !== 0) return;
+      lastStatsMtime = fileStat.mtimeMs;
+
       const raw = fs.readFileSync(STATS_FILE, 'utf8');
       const data = JSON.parse(raw);
       if (data && typeof data.totalQueries === 'number') {
@@ -164,14 +173,23 @@ function loadPersistedStats() {
         if (stats.totalQueries > 0) {
           stats.averageLatency = Math.round(stats.totalLatency / stats.totalQueries);
         }
-        if (Array.isArray(data.recentQueries) && data.recentQueries.length > 0 && recentQueries.length === 0) {
-          recentQueries.push(...data.recentQueries.slice(0, 50));
+        if (Array.isArray(data.recentQueries) && data.recentQueries.length > 0) {
+          const queryMap = new Map();
+          data.recentQueries.forEach(q => {
+            if (q && q.domain) queryMap.set(`${q.timestamp}_${q.domain}_${q.type}`, q);
+          });
+          recentQueries.forEach(q => {
+            if (q && q.domain) queryMap.set(`${q.timestamp}_${q.domain}_${q.type}`, q);
+          });
+          const merged = Array.from(queryMap.values()).sort((a, b) => b.timestamp - a.timestamp);
+          recentQueries.length = 0;
+          recentQueries.push(...merged.slice(0, 50));
         }
         if (Array.isArray(data.upstreams)) {
           data.upstreams.forEach(savedUp => {
             const found = upstreamStates.find(u => u.name === savedUp.name);
             if (found && typeof savedUp.routedQueries === 'number') {
-              found.routedQueries = Math.max(found.routedQueries, savedUp.routedQueries);
+              found.routedQueries = Math.max(found.routedQueries || 0, savedUp.routedQueries);
             }
           });
         }
@@ -180,29 +198,23 @@ function loadPersistedStats() {
   } catch (e) {}
 }
 
-let saveDebounceTimer = null;
-function persistStats() {
-  if (saveDebounceTimer) return;
-  saveDebounceTimer = setTimeout(() => {
-    saveDebounceTimer = null;
-    try {
-      const payload = {
-        totalQueries: stats.totalQueries,
-        cacheHits: stats.cacheHits,
-        cacheMisses: stats.cacheMisses,
-        swrHits: stats.swrHits,
-        repairedPackets: stats.repairedPackets || 0,
-        errors: stats.errors,
-        totalLatency: stats.totalLatency,
-        averageLatency: stats.averageLatency,
-        upstreams: upstreamStates.map(u => ({ name: u.name, routedQueries: u.routedQueries })),
-        recentQueries: recentQueries.slice(0, 50),
-        savedAt: Date.now()
-      };
-      fs.writeFileSync(STATS_FILE, JSON.stringify(payload));
-    } catch (e) {}
-  }, 1000);
-  if (saveDebounceTimer.unref) saveDebounceTimer.unref();
+function persistStats(immediate = true) {
+  try {
+    const payload = {
+      totalQueries: stats.totalQueries,
+      cacheHits: stats.cacheHits,
+      cacheMisses: stats.cacheMisses,
+      swrHits: stats.swrHits,
+      repairedPackets: stats.repairedPackets || 0,
+      errors: stats.errors,
+      totalLatency: stats.totalLatency,
+      averageLatency: stats.averageLatency,
+      upstreams: upstreamStates.map(u => ({ name: u.name, routedQueries: u.routedQueries })),
+      recentQueries: recentQueries.slice(0, 50),
+      savedAt: Date.now()
+    };
+    fs.writeFileSync(STATS_FILE, JSON.stringify(payload));
+  } catch (e) {}
 }
 
 // Initial state load
@@ -1050,20 +1062,30 @@ function handleStreamRequest(req, res) {
     'X-Accel-Buffering': 'no'
   });
 
-  // Send initial state immediately
+  // Send initial snapshot state immediately
   res.write(`data: ${JSON.stringify(getStatsSnapshot())}\n\n`);
 
   sseClients.add(res);
 
-  // Send heartbeat / update every 1.5 seconds
+  let lastHash = '';
+  // Heartbeat & delta check every 2.5 seconds (sends data ONLY when changed, else lightweight : ping)
   const interval = setInterval(() => {
     try {
-      res.write(`data: ${JSON.stringify(getStatsSnapshot())}\n\n`);
+      const snap = getStatsSnapshot();
+      const topQ = snap.recentQueries && snap.recentQueries[0];
+      const curHash = `${snap.totalQueries}:${snap.repairedPackets}:${snap.cacheHits}:${topQ ? topQ.timestamp : 0}`;
+      if (curHash !== lastHash) {
+        lastHash = curHash;
+        res.write(`data: ${JSON.stringify(snap)}\n\n`);
+      } else {
+        // SSE comment keep-alive ping: keeps connection open without triggering client onmessage reflow
+        res.write(': ping\n\n');
+      }
     } catch (e) {
       clearInterval(interval);
       sseClients.delete(res);
     }
-  }, 1500);
+  }, 2500);
 
   req.on('close', () => {
     clearInterval(interval);
@@ -1176,16 +1198,9 @@ function generateMobileConfig(host) {
                 <string>HTTPS</string>
                 <key>ServerURL</key>
                 <string>${dohUrl}</string>
-                <key>ServerAddresses</key>
-                <array>
-                    <string>1.1.1.1</string>
-                    <string>8.8.8.8</string>
-                    <string>1.0.0.1</string>
-                    <string>8.8.4.4</string>
-                </array>
             </dict>
             <key>PayloadDescription</key>
-            <string>Cấu hình DNS-over-HTTPS (DoH) Antigravity Proxy với kết nối dự phòng IPv4 bootstrap.</string>
+            <string>Mã hóa và tăng tốc toàn bộ truy vấn DNS DoH qua Antigravity Proxy.</string>
             <key>PayloadDisplayName</key>
             <string>Antigravity DoH Security</string>
             <key>PayloadIdentifier</key>
@@ -1589,6 +1604,7 @@ function renderDashboardHtml(req) {
         /* Table */
         .table-container {
             overflow-x: auto;
+            border-radius: 8px;
         }
 
         table {
@@ -1596,6 +1612,7 @@ function renderDashboardHtml(req) {
             border-collapse: collapse;
             text-align: left;
             font-size: 0.9rem;
+            table-layout: fixed;
         }
 
         th {
@@ -1603,12 +1620,41 @@ function renderDashboardHtml(req) {
             border-bottom: 2px solid var(--surface-border);
             color: var(--text-muted);
             font-weight: 600;
+            white-space: nowrap;
         }
 
         td {
-            padding: 12px 14px;
+            padding: 11px 14px;
             border-bottom: 1px solid rgba(255, 255, 255, 0.05);
             color: var(--text-main);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .quick-chips {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 10px;
+            align-items: center;
+        }
+
+        .chip {
+            background: #111827;
+            border: 1px solid #1f2937;
+            color: var(--primary);
+            padding: 5px 12px;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .chip:hover {
+            background: #1e293b;
+            border-color: var(--primary);
+            transform: translateY(-1px);
         }
 
         .status-dot {
@@ -1643,6 +1689,12 @@ function renderDashboardHtml(req) {
 
         .badge-repair {
             background: rgba(192, 132, 252, 0.2);
+            color: var(--color-purple);
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 700;
+        }
             color: var(--color-purple);
             padding: 3px 8px;
             border-radius: 4px;
@@ -1755,6 +1807,14 @@ function renderDashboardHtml(req) {
                 </select>
                 <button class="btn-test" onclick="executeDoHTest()">Gửi truy vấn DoH</button>
             </div>
+            <div class="quick-chips">
+                <span style="font-size: 0.82rem; color: var(--text-muted);">Thử nhanh 1-chạm:</span>
+                <button type="button" class="chip" onclick="quickTest('google.com', 'A')">google.com</button>
+                <button type="button" class="chip" onclick="quickTest('apple.com', 'A')">apple.com</button>
+                <button type="button" class="chip" onclick="quickTest('shopee.vn', 'A')">shopee.vn</button>
+                <button type="button" class="chip" onclick="quickTest('vnexpress.net', 'A')">vnexpress.net</button>
+                <button type="button" class="chip" onclick="quickTest('cloudflare.com', 'AAAA')">cloudflare.com (IPv6)</button>
+            </div>
             <div id="test-result-box" class="test-result-box">
                 <div id="test-result-meta" style="color: var(--primary); margin-bottom: 8px; font-weight: 600;"></div>
                 <div id="test-result-pre"></div>
@@ -1769,6 +1829,14 @@ function renderDashboardHtml(req) {
             </div>
             <div class="table-container">
                 <table>
+                    <colgroup>
+                        <col style="width: 105px;">
+                        <col style="width: 260px;">
+                        <col style="width: 75px;">
+                        <col style="width: 175px;">
+                        <col style="width: 85px;">
+                        <col style="width: 160px;">
+                    </colgroup>
                     <thead>
                         <tr>
                             <th>Thời gian</th>
@@ -1791,6 +1859,13 @@ function renderDashboardHtml(req) {
             <h2>🏆 Bảng xếp hạng máy chủ DNS Upstream</h2>
             <div class="table-container">
                 <table>
+                    <colgroup>
+                        <col style="width: 220px;">
+                        <col style="width: 140px;">
+                        <col style="width: 160px;">
+                        <col style="width: 130px;">
+                        <col style="width: 140px;">
+                    </colgroup>
                     <thead>
                         <tr>
                             <th>DNS Server</th>
@@ -1823,11 +1898,77 @@ function renderDashboardHtml(req) {
             });
         }
 
-        // Monotonic Persistence: Never let totalQueries regress or reset to 0 in UI
+        function setElText(id, newText) {
+            const el = document.getElementById(id);
+            if (el && el.innerText !== String(newText)) {
+                el.innerText = String(newText);
+            }
+        }
+
+        function setElHtml(id, newHtml) {
+            const el = document.getElementById(id);
+            if (el && el.innerHTML !== newHtml) {
+                el.innerHTML = newHtml;
+            }
+        }
+
         let localTotal = parseInt(localStorage.getItem('antigravity_total_queries') || '0', 10);
         let localHits = parseInt(localStorage.getItem('antigravity_cache_hits') || '0', 10);
         let localSwr = parseInt(localStorage.getItem('antigravity_swr_hits') || '0', 10);
         let localRepaired = parseInt(localStorage.getItem('antigravity_repaired') || '0', 10);
+        let cachedQueries = [];
+        try {
+            cachedQueries = JSON.parse(localStorage.getItem('antigravity_recent_queries') || '[]');
+        } catch (e) {}
+
+        let lastQueriesSig = '';
+        function renderRecentQueries(queries) {
+            if (!queries || queries.length === 0) return;
+            
+            // Signature check: if query list is identical, DO NOT touch DOM at all
+            const sig = queries.slice(0, 20).map(q => q.timestamp + '_' + q.domain + '_' + q.status + '_' + q.latency).join('|');
+            if (sig === lastQueriesSig) return;
+            lastQueriesSig = sig;
+
+            const tbody = document.getElementById('recent-queries-body');
+            const rows = queries.map(q => {
+                const timeStr = new Date(q.timestamp).toLocaleTimeString();
+                let badgeClass = 'badge-winner';
+                if (q.status && (q.status.includes('Cache') || q.status.includes('SWR'))) badgeClass = 'badge-cache';
+                if (q.status && q.status.includes('Repaired')) badgeClass = 'badge-repair';
+
+                return '<tr>' +
+                    '<td style="color: var(--text-muted); font-size: 0.85rem;">' + timeStr + '</td>' +
+                    '<td title="' + escapeHtml(q.domain) + '"><strong style="color: #fff;">' + escapeHtml(q.domain) + '</strong></td>' +
+                    '<td><span style="background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 4px; font-size: 0.75rem;">' + escapeHtml(q.type) + '</span></td>' +
+                    '<td title="' + escapeHtml(q.upstreamName) + '">' + escapeHtml(q.upstreamName) + '</td>' +
+                    '<td style="font-weight: 600; color: ' + (q.latency < 25 ? 'var(--color-healthy)' : 'var(--text-main)') + ';">' + q.latency + 'ms</td>' +
+                    '<td><span class="' + badgeClass + '">' + escapeHtml(q.status) + '</span></td>' +
+                '</tr>';
+            }).join('');
+
+            tbody.innerHTML = rows;
+        }
+
+        let lastUpstreamsSig = '';
+        function renderUpstreams(upstreams) {
+            if (!upstreams || upstreams.length === 0) return;
+            const sig = upstreams.map(u => u.name + '_' + u.status + '_' + u.routedQueries + '_' + (u.realAvgLatency || u.avgLatency)).join('|');
+            if (sig === lastUpstreamsSig) return;
+            lastUpstreamsSig = sig;
+
+            const tbody = document.getElementById('dns-table-body');
+            tbody.innerHTML = upstreams.map(u => {
+                const isHealthy = u.status === 'Healthy';
+                return '<tr>' +
+                    '<td><strong>' + escapeHtml(u.name) + '</strong></td>' +
+                    '<td><code>' + escapeHtml(u.ip) + '</code></td>' +
+                    '<td><span style="color: ' + (isHealthy ? 'var(--color-healthy)' : 'var(--color-warning)') + '; font-weight: 700;">' + (u.realAvgLatency || u.avgLatency || 20) + ' ms</span></td>' +
+                    '<td><span class="status-dot status-' + u.status + '"></span>' + u.status + '</td>' +
+                    '<td><span class="badge-winner">' + (u.routedQueries || 0) + ' truy vấn</span></td>' +
+                '</tr>';
+            }).join('');
+        }
 
         function updateUI(data) {
             if (!data) return;
@@ -1842,49 +1983,34 @@ function renderDashboardHtml(req) {
             localStorage.setItem('antigravity_swr_hits', localSwr);
             localStorage.setItem('antigravity_repaired', localRepaired);
 
-            document.getElementById('total-queries').innerText = localTotal.toLocaleString();
+            // Merge incoming queries with local cache
+            if (Array.isArray(data.recentQueries) && data.recentQueries.length > 0) {
+                const map = new Map();
+                data.recentQueries.forEach(q => map.set(q.timestamp + '_' + q.domain + '_' + q.type, q));
+                cachedQueries.forEach(q => {
+                    const key = q.timestamp + '_' + q.domain + '_' + q.type;
+                    if (!map.has(key)) map.set(key, q);
+                });
+                cachedQueries = Array.from(map.values()).sort((a, b) => b.timestamp - a.timestamp).slice(0, 40);
+                try {
+                    localStorage.setItem('antigravity_recent_queries', JSON.stringify(cachedQueries));
+                } catch (e) {}
+            }
+
+            setElText('total-queries', localTotal.toLocaleString());
             const hitRate = localTotal > 0 ? Math.round((localHits / localTotal) * 100) : 0;
-            document.getElementById('cache-hit-rate').innerHTML = hitRate + '<span class="stat-unit">%</span>';
-            document.getElementById('swr-hits').innerText = localSwr.toLocaleString();
-            document.getElementById('repaired-packets').innerText = localRepaired.toLocaleString();
-            document.getElementById('avg-latency').innerHTML = (data.averageLatency || 15) + '<span class="stat-unit">ms</span>';
-            document.getElementById('pool-size').innerHTML = (data.poolSize || 3) + '<span class="stat-unit">máy chủ</span>';
+            setElHtml('cache-hit-rate', hitRate + '<span class="stat-unit">%</span>');
+            setElText('swr-hits', localSwr.toLocaleString());
+            setElText('repaired-packets', localRepaired.toLocaleString());
+            setElHtml('avg-latency', (data.averageLatency || 15) + '<span class="stat-unit">ms</span>');
+            setElHtml('pool-size', (data.poolSize || 3) + '<span class="stat-unit">máy chủ</span>');
 
-            // Upstreams Leaderboard
-            const tbody = document.getElementById('dns-table-body');
-            if (data.upstreams && data.upstreams.length > 0) {
-                tbody.innerHTML = data.upstreams.map(u => {
-                    const isHealthy = u.status === 'Healthy';
-                    return '<tr>' +
-                        '<td><strong>' + escapeHtml(u.name) + '</strong></td>' +
-                        '<td><code>' + escapeHtml(u.ip) + '</code></td>' +
-                        '<td><span style="color: ' + (isHealthy ? 'var(--color-healthy)' : 'var(--color-warning)') + '; font-weight: 700;">' + (u.realAvgLatency || u.avgLatency || 20) + ' ms</span></td>' +
-                        '<td><span class="status-dot status-' + u.status + '"></span>' + u.status + '</td>' +
-                        '<td><span class="badge-winner">' + (u.routedQueries || 0) + ' truy vấn</span></td>' +
-                    '</tr>';
-                }).join('');
-            }
-
-            // Real-Time Query Logs Table
-            const recentBody = document.getElementById('recent-queries-body');
-            if (data.recentQueries && data.recentQueries.length > 0) {
-                recentBody.innerHTML = data.recentQueries.map(q => {
-                    const timeStr = new Date(q.timestamp).toLocaleTimeString();
-                    let badgeClass = 'badge-winner';
-                    if (q.status.includes('Cache') || q.status.includes('SWR')) badgeClass = 'badge-cache';
-                    if (q.status.includes('Repaired')) badgeClass = 'badge-repair';
-
-                    return '<tr>' +
-                        '<td style="color: var(--text-muted); font-size: 0.85rem;">' + timeStr + '</td>' +
-                        '<td><strong>' + escapeHtml(q.domain) + '</strong></td>' +
-                        '<td><code>' + escapeHtml(q.type) + '</code></td>' +
-                        '<td>' + escapeHtml(q.upstreamName) + '</td>' +
-                        '<td style="font-weight: 600; color: ' + (q.latency < 25 ? 'var(--color-healthy)' : 'var(--text-main)') + ';">' + q.latency + 'ms</td>' +
-                        '<td><span class="' + badgeClass + '">' + escapeHtml(q.status) + '</span></td>' +
-                    '</tr>';
-                }).join('');
-            }
+            renderUpstreams(data.upstreams);
+            renderRecentQueries(cachedQueries.length > 0 ? cachedQueries : data.recentQueries);
         }
+
+        let isSseLive = false;
+        let pollTimer = null;
 
         async function fetchStats() {
             try {
@@ -1895,12 +2021,25 @@ function renderDashboardHtml(req) {
             } catch (err) {}
         }
 
-        // Live Real-Time Connection with Server-Sent Events (SSE) + Auto-Reconnect & Fallback
+        function startFallbackPolling() {
+            if (pollTimer) return;
+            pollTimer = setInterval(() => {
+                if (!isSseLive) {
+                    fetchStats();
+                }
+            }, 4000);
+        }
+
         function initRealtimeStream() {
             if (window.EventSource) {
                 const es = new EventSource('/api/stream');
                 es.onopen = () => {
-                    document.getElementById('stream-status-text').innerText = 'Realtime Live';
+                    isSseLive = true;
+                    setElText('stream-status-text', 'Realtime SSE');
+                    if (pollTimer) {
+                        clearInterval(pollTimer);
+                        pollTimer = null;
+                    }
                 };
                 es.onmessage = (event) => {
                     try {
@@ -1909,10 +2048,14 @@ function renderDashboardHtml(req) {
                     } catch (e) {}
                 };
                 es.onerror = () => {
-                    document.getElementById('stream-status-text').innerText = 'Đang đồng bộ';
+                    isSseLive = false;
+                    setElText('stream-status-text', 'Đang đồng bộ');
                     es.close();
-                    setTimeout(initRealtimeStream, 3000);
+                    startFallbackPolling();
+                    setTimeout(initRealtimeStream, 4000);
                 };
+            } else {
+                startFallbackPolling();
             }
         }
 
@@ -1921,10 +2064,12 @@ function renderDashboardHtml(req) {
             localHits = 0;
             localSwr = 0;
             localRepaired = 0;
+            cachedQueries = [];
             localStorage.removeItem('antigravity_total_queries');
             localStorage.removeItem('antigravity_cache_hits');
             localStorage.removeItem('antigravity_swr_hits');
             localStorage.removeItem('antigravity_repaired');
+            localStorage.removeItem('antigravity_recent_queries');
             try {
                 await fetch('/api/reset-stats', { method: 'POST' });
             } catch (e) {}
@@ -1965,13 +2110,22 @@ function renderDashboardHtml(req) {
             }
         }
 
+        function quickTest(domain, type) {
+            document.getElementById('test-domain-input').value = domain;
+            document.getElementById('test-type-select').value = type;
+            executeDoHTest();
+        }
+
         function escapeHtml(str) {
             return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
         }
 
+        // Initialize on load
+        if (cachedQueries.length > 0) {
+            renderRecentQueries(cachedQueries);
+        }
         fetchStats();
         initRealtimeStream();
-        setInterval(fetchStats, 2000);
     </script>
 </body>
 </html>`;
