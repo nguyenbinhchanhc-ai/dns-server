@@ -34,6 +34,10 @@
       "destination": "/api/stats"
     },
     {
+      "source": "/api/stream",
+      "destination": "/api/stream"
+    },
+    {
       "source": "/api/reset-stats",
       "destination": "/api/reset-stats"
     },

@@ -7,7 +7,7 @@
     "dev": "node server.js",
     "start": "node server.js",
     "build": "echo 'Build complete'",
-    "lint": "node --check server.js test-client.js api/index.js api/dns-query.js api/ping.js api/stats.js api/test-doh.js api/profile.js",
+    "lint": "node --check server.js test-client.js api/index.js api/dns-query.js api/ping.js api/stats.js api/stream.js api/test-doh.js api/profile.js",
     "test": "node test-client.js"
   },
   "dependencies": {

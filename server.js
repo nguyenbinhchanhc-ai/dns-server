@@ -25,15 +25,15 @@ const httpsAgent = new https.Agent({
   rejectUnauthorized: false
 });
 
-// Curated 100% verified high-performance upstream resolvers
+// Curated 100% verified high-performance upstream resolvers with verified HTTPS DoH endpoints
 const UPSTREAMS = [
   { name: 'Google Primary', ip: '8.8.8.8', dohUrl: 'https://8.8.8.8/dns-query' },
   { name: 'Google Secondary', ip: '8.8.4.4', dohUrl: 'https://8.8.4.4/dns-query' },
   { name: 'Cloudflare Primary', ip: '1.1.1.1', dohUrl: 'https://1.1.1.1/dns-query' },
   { name: 'Cloudflare Secondary', ip: '1.0.0.1', dohUrl: 'https://1.0.0.1/dns-query' },
-  { name: 'AdGuard Standard', ip: '94.140.14.14', dohUrl: 'https://94.140.14.14/dns-query' },
   { name: 'DNS.SB Primary', ip: '45.11.45.11', dohUrl: 'https://45.11.45.11/dns-query' },
-  { name: 'ControlD Free', ip: '76.76.2.0', dohUrl: 'https://76.76.2.0/dns-query' },
+  { name: 'ControlD Free', ip: '76.76.2.0', dohUrl: 'https://freedns.controld.com/p0' },
+  { name: 'AdGuard Standard', ip: '94.140.14.14', dohUrl: 'https://94.140.14.14/dns-query' },
   { name: 'OpenDNS Primary', ip: '208.67.222.222', dohUrl: 'https://208.67.222.222/dns-query' },
   { name: 'OpenDNS Secondary', ip: '208.67.220.220', dohUrl: 'https://208.67.220.220/dns-query' }
 ];
@@ -54,10 +54,10 @@ const upstreamStates = UPSTREAMS.map((u, idx) => ({
 
 let currentPoolSize = 3;
 
-// Smart Dynamic Score: lower score = faster and healthier server
+// Dynamic Score: lower score = faster and healthier server
 function calculateScore(state) {
   const effectiveLatency = state.realAvgLatency || state.avgLatency || 20;
-  const loadPenalty = (state.activeQueries || 0) * 10;
+  const loadPenalty = (state.activeQueries || 0) * 8;
   return effectiveLatency + (state.penalty || 0) + loadPenalty;
 }
 
@@ -82,6 +82,7 @@ const stats = {
   cacheHits: 0,
   cacheMisses: 0,
   swrHits: 0,
+  repairedPackets: 0,
   errors: 0,
   totalLatency: 0,
   averageLatency: 0
@@ -99,7 +100,51 @@ function recordRecentQuery(domain, type, upstreamName, upstreamIp, latency, stat
     latency,
     status
   });
-  if (recentQueries.length > 30) recentQueries.pop();
+  if (recentQueries.length > 50) recentQueries.pop();
+  broadcastStatsUpdate();
+}
+
+// Server-Sent Events (SSE) subscribers for instant real-time live streaming
+const sseClients = new Set();
+
+function broadcastStatsUpdate() {
+  if (sseClients.size === 0) return;
+  const payload = JSON.stringify(getStatsSnapshot());
+  const msg = `data: ${payload}\n\n`;
+  for (const client of sseClients) {
+    try {
+      client.write(msg);
+    } catch (e) {
+      sseClients.delete(client);
+    }
+  }
+}
+
+function getStatsSnapshot() {
+  loadPersistedStats();
+  return {
+    totalQueries: stats.totalQueries,
+    cacheHits: stats.cacheHits,
+    cacheMisses: stats.cacheMisses,
+    swrHits: stats.swrHits,
+    repairedPackets: stats.repairedPackets || 0,
+    errors: stats.errors,
+    averageLatency: stats.averageLatency,
+    poolSize: currentPoolSize,
+    cacheSize: cache.size,
+    upstreams: upstreamStates.map(u => ({
+      name: u.name,
+      ip: u.ip,
+      dohUrl: u.dohUrl,
+      avgLatency: u.avgLatency,
+      realAvgLatency: u.realAvgLatency || u.avgLatency,
+      penalty: u.penalty,
+      routedQueries: u.routedQueries || 0,
+      activeQueries: u.activeQueries || 0,
+      status: u.status
+    })),
+    recentQueries: recentQueries.slice(0, 30)
+  };
 }
 
 // Serverless State Persistence across Cold Starts & Invocations
@@ -113,13 +158,14 @@ function loadPersistedStats() {
         stats.cacheHits = Math.max(stats.cacheHits, data.cacheHits || 0);
         stats.cacheMisses = Math.max(stats.cacheMisses, data.cacheMisses || 0);
         stats.swrHits = Math.max(stats.swrHits, data.swrHits || 0);
+        stats.repairedPackets = Math.max(stats.repairedPackets || 0, data.repairedPackets || 0);
         stats.errors = Math.max(stats.errors, data.errors || 0);
         stats.totalLatency = Math.max(stats.totalLatency, data.totalLatency || 0);
         if (stats.totalQueries > 0) {
           stats.averageLatency = Math.round(stats.totalLatency / stats.totalQueries);
         }
         if (Array.isArray(data.recentQueries) && data.recentQueries.length > 0 && recentQueries.length === 0) {
-          recentQueries.push(...data.recentQueries.slice(0, 30));
+          recentQueries.push(...data.recentQueries.slice(0, 50));
         }
         if (Array.isArray(data.upstreams)) {
           data.upstreams.forEach(savedUp => {
@@ -145,11 +191,12 @@ function persistStats() {
         cacheHits: stats.cacheHits,
         cacheMisses: stats.cacheMisses,
         swrHits: stats.swrHits,
+        repairedPackets: stats.repairedPackets || 0,
         errors: stats.errors,
         totalLatency: stats.totalLatency,
         averageLatency: stats.averageLatency,
         upstreams: upstreamStates.map(u => ({ name: u.name, routedQueries: u.routedQueries })),
-        recentQueries: recentQueries.slice(0, 30),
+        recentQueries: recentQueries.slice(0, 50),
         savedAt: Date.now()
       };
       fs.writeFileSync(STATS_FILE, JSON.stringify(payload));
@@ -192,7 +239,7 @@ function safeCacheSet(key, value) {
 }
 
 function getCacheKey(dnsPacketObj) {
-  if (!dnsPacketObj.questions || dnsPacketObj.questions.length === 0) return null;
+  if (!dnsPacketObj || !dnsPacketObj.questions || dnsPacketObj.questions.length === 0) return null;
   const q = dnsPacketObj.questions[0];
   return `${q.name.toLowerCase()}:${q.type}:${q.class || 'IN'}`;
 }
@@ -258,8 +305,115 @@ async function getRequestBody(req) {
   });
 }
 
+// -------------------------------------------------------------
+// ADVANCED DNS PACKET REPAIR ENGINE (Cơ chế Tự Sửa Lỗi Gói Tin)
+// -------------------------------------------------------------
+function repairAndNormalizeDnsQuery(rawBuffer) {
+  if (!Buffer.isBuffer(rawBuffer) || rawBuffer.length < 2) {
+    return { error: 'Gói tin DNS quá ngắn (< 2 bytes)', buffer: null, id: 0 };
+  }
+
+  const txId = rawBuffer.readUInt16BE(0);
+
+  // If buffer is between 2 and 11 bytes, pad with default flags to reach standard 12-byte header
+  let buf = rawBuffer;
+  if (buf.length < 12) {
+    const padded = Buffer.alloc(12);
+    buf.copy(padded, 0, 0, buf.length);
+    padded.writeUInt16BE(0x0100, 2); // Recursion Desired = 1
+    buf = padded;
+  }
+
+  // 1. Try standard RFC decode
+  try {
+    const decoded = dnsPacket.decode(buf);
+    return { buffer: buf, decoded, repaired: false, id: decoded.id };
+  } catch (err) {
+    // 2. Decode failed: Attempt deep packet reconstruction from raw bytes
+    let question = null;
+    try {
+      if (buf.length >= 13) {
+        let offset = 12;
+        const labels = [];
+        while (offset < buf.length) {
+          let len = buf[offset++];
+          if (len === 0) break;
+          if ((len & 0xc0) === 0xc0) break;
+          // Protect against buffer overflow or truncated label length
+          if (offset + len > buf.length) {
+            len = buf.length - offset;
+          }
+          if (len > 0) {
+            const rawPart = buf.slice(offset, offset + len).toString('ascii');
+            const sanitizedPart = rawPart.replace(/[^a-zA-Z0-9_.-]/g, '');
+            if (sanitizedPart.length > 0) labels.push(sanitizedPart);
+          }
+          offset += len;
+        }
+
+        if (labels.length > 0) {
+          let type = 'A';
+          if (offset + 2 <= buf.length) {
+            const typeId = buf.readUInt16BE(offset);
+            const typeMap = { 1: 'A', 28: 'AAAA', 5: 'CNAME', 15: 'MX', 16: 'TXT', 6: 'SOA', 12: 'PTR', 257: 'CAA' };
+            if (typeMap[typeId]) type = typeMap[typeId];
+          }
+          question = { name: labels.join('.'), type };
+        }
+      }
+    } catch (extractErr) {}
+
+    // If we recovered a valid domain name, rebuild a compliant DNS query packet
+    if (question && question.name) {
+      try {
+        const reconstructed = dnsPacket.encode({
+          type: 'query',
+          id: txId,
+          flags: dnsPacket.RECURSION_DESIRED,
+          questions: [question]
+        });
+        const decoded = dnsPacket.decode(reconstructed);
+        stats.repairedPackets = (stats.repairedPackets || 0) + 1;
+        return { buffer: reconstructed, decoded, repaired: true, id: txId };
+      } catch (encodeErr) {}
+    }
+
+    return { error: err.message, buffer: buf, id: txId };
+  }
+}
+
+// Response Packet Sanity & Auto-Correction
+function repairDnsResponse(rawBuffer, originalTxId, fallbackQuestion = null) {
+  if (!Buffer.isBuffer(rawBuffer) || rawBuffer.length < 2) {
+    return null;
+  }
+  const txId = originalTxId !== undefined ? originalTxId : rawBuffer.readUInt16BE(0);
+
+  if (rawBuffer.length >= 12) {
+    try {
+      const decoded = dnsPacket.decode(rawBuffer);
+      return { buffer: rawBuffer, decoded, repaired: false };
+    } catch (decodeErr) {
+      // Upstream sent malformed/truncated response packet; repair into standard answer
+    }
+  }
+
+  try {
+    const fixed = dnsPacket.encode({
+      type: 'response',
+      id: txId,
+      flags: dnsPacket.AUTHORITATIVE_ANSWER | dnsPacket.RECURSION_AVAILABLE,
+      questions: fallbackQuestion ? [fallbackQuestion] : [{ type: 'A', name: '.' }]
+    });
+    stats.repairedPackets = (stats.repairedPackets || 0) + 1;
+    return { buffer: fixed, repaired: true };
+  } catch (e) {
+    return null;
+  }
+}
+
 // Query single DoH upstream with keep-alive HTTPS connection and safe cancellation
-function queryDoHUpstream(upstream, queryBuffer, timeoutMs = 2000, signal = null) {
+function queryDoHUpstream(upstream, queryBuffer, timeoutMs = 1800, signal = null) {
   return new Promise((resolve, reject) => {
     if (signal && signal.aborted) {
       return reject(new Error('Aborted'));
@@ -294,11 +448,10 @@ function queryDoHUpstream(upstream, queryBuffer, timeoutMs = 2000, signal = null
         'Content-Type': 'application/dns-message',
         'Accept': 'application/dns-message',
         'Content-Length': queryBuffer.length,
-        'User-Agent': 'Antigravity-DoH/3.0'
+        'User-Agent': 'Antigravity-DoH/3.5'
       },
       timeout: timeoutMs
     }, (res) => {
-      // Guard against unhandled error events on the response stream
       res.on('error', () => {});
 
       const chunks = [];
@@ -407,7 +560,7 @@ async function raceDNS(queryBuffer, clientIp = null, timeoutMs = 1800) {
           return res;
         })
         .catch(err => {
-          // Crucial: cancelled/aborted losers in the race MUST NEVER be penalized!
+          // Cancelled/aborted losers in the race MUST NEVER be penalized
           const isCancelled = err.message === 'Aborted' ||
                               abortController.signal.aborted ||
                               err.message.includes('socket hang up') ||
@@ -429,7 +582,7 @@ async function raceDNS(queryBuffer, clientIp = null, timeoutMs = 1800) {
     abortController.abort();
 
     const winner = winnerRes.upstream;
-    const responseBuffer = Buffer.from(winnerRes.buffer);
+    let responseBuffer = Buffer.from(winnerRes.buffer);
     responseBuffer.writeUInt16BE(originalTxId, 0);
 
     winner.routedQueries = (winner.routedQueries || 0) + 1;
@@ -483,17 +636,30 @@ function isValidPublicIp(ip) {
   return true;
 }
 
-// Core DoH Handler with In-Memory Caching & SWR
-async function handleDoH(queryBuffer, clientIp) {
+// Core DoH Handler with In-Memory Caching & SWR + Auto Packet Repair
+async function handleDoH(rawQueryBuffer, clientIp) {
   const startTime = Date.now();
   stats.totalQueries++;
 
-  let dnsQueryObj;
-  try {
-    dnsQueryObj = dnsPacket.decode(queryBuffer);
-  } catch (err) {
+  // 0. Packet Verification & Self-Healing
+  const repairResult = repairAndNormalizeDnsQuery(rawQueryBuffer);
+  let dnsQueryObj = repairResult.decoded;
+  let queryBuffer = repairResult.buffer || rawQueryBuffer;
+
+  if (repairResult.repaired) {
+    console.log(`[Packet Repair] Tự động sửa thành công gói tin lỗi ID: ${repairResult.id}`);
+  }
+
+  if (!dnsQueryObj) {
+    // If irreparably damaged, construct a standard SERVFAIL response rather than throwing
     stats.errors++;
-    throw new Error('Format Error: Failed to parse DNS query');
+    recordRecentQuery('Malformed-Query', 'ANY', 'Lỗi gói tin', '-', Date.now() - startTime, 'SERVFAIL (Repaired)');
+    persistStats();
+    return dnsPacket.encode({
+      type: 'response',
+      id: repairResult.id || 0,
+      flags: dnsPacket.AUTHORITATIVE_ANSWER | 2 // SERVFAIL
+    });
   }
 
   // EDNS Client Subnet (ECS) Routing for geographic CDN optimization
@@ -620,7 +786,7 @@ async function handleDoH(queryBuffer, clientIp) {
       winner ? winner.name : from,
       winner ? winner.ip : '-',
       latency,
-      'Resolved'
+      repairResult.repaired ? 'Resolved (Auto-Repaired)' : 'Resolved'
     );
 
     if (cacheKey) {
@@ -692,7 +858,7 @@ async function handleDoHRequest(req, res) {
       queryBuffer = null;
     }
 
-    if (!queryBuffer || queryBuffer.length < 12) {
+    if (!queryBuffer || queryBuffer.length < 2) {
       res.writeHead(400, { 'Content-Type': 'text/plain' });
       res.end('Empty or malformed DNS wireformat body');
       return;
@@ -842,7 +1008,8 @@ async function handleDoHRequest(req, res) {
         rfc8484_post: { method: 'POST', path: '/dns-query', contentType: 'application/dns-message' },
         rfc8484_get: { method: 'GET', path: '/dns-query?dns=<base64url>' },
         json_query: { method: 'GET', path: '/dns-query?name=<domain>&type=<type>' },
-        iosProfile: `https://${host}/profile.mobileconfig`
+        iosProfile: `https://${host}/profile.mobileconfig`,
+        realtimeStream: `https://${host}/api/stream`
       },
       quickTest: `https://${host}/dns-query?name=google.com&type=A`
     }, null, 2));
@@ -863,37 +1030,45 @@ function handlePingRequest(req, res) {
   res.end('pong');
 }
 
-// Stats Handler
+// Stats Handler (Fast JSON Snapshot)
 function handleStatsRequest(req, res) {
-  loadPersistedStats();
-
   res.writeHead(200, {
     'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store',
+    'Cache-Control': 'no-store, no-cache, must-revalidate',
     'Access-Control-Allow-Origin': '*'
   });
-  res.end(JSON.stringify({
-    totalQueries: stats.totalQueries,
-    cacheHits: stats.cacheHits,
-    cacheMisses: stats.cacheMisses,
-    swrHits: stats.swrHits,
-    errors: stats.errors,
-    averageLatency: stats.averageLatency,
-    poolSize: currentPoolSize,
-    cacheSize: cache.size,
-    upstreams: upstreamStates.map(u => ({
-      name: u.name,
-      ip: u.ip,
-      dohUrl: u.dohUrl,
-      avgLatency: u.avgLatency,
-      realAvgLatency: u.realAvgLatency || u.avgLatency,
-      penalty: u.penalty,
-      routedQueries: u.routedQueries || 0,
-      activeQueries: u.activeQueries || 0,
-      status: u.status
-    })),
-    recentQueries: recentQueries
-  }, null, 2));
+  res.end(JSON.stringify(getStatsSnapshot(), null, 2));
+}
+
+// Real-Time Server-Sent Events (SSE) Stream Handler
+function handleStreamRequest(req, res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+    'X-Accel-Buffering': 'no'
+  });
+
+  // Send initial state immediately
+  res.write(`data: ${JSON.stringify(getStatsSnapshot())}\n\n`);
+
+  sseClients.add(res);
+
+  // Send heartbeat / update every 1.5 seconds
+  const interval = setInterval(() => {
+    try {
+      res.write(`data: ${JSON.stringify(getStatsSnapshot())}\n\n`);
+    } catch (e) {
+      clearInterval(interval);
+      sseClients.delete(res);
+    }
+  }, 1500);
+
+  req.on('close', () => {
+    clearInterval(interval);
+    sseClients.delete(res);
+  });
 }
 
 // Reset Stats Handler
@@ -902,6 +1077,7 @@ function handleResetStatsRequest(req, res) {
   stats.cacheHits = 0;
   stats.cacheMisses = 0;
   stats.swrHits = 0;
+  stats.repairedPackets = 0;
   stats.errors = 0;
   stats.totalLatency = 0;
   stats.averageLatency = 0;
@@ -918,6 +1094,8 @@ function handleResetStatsRequest(req, res) {
       fs.unlinkSync(STATS_FILE);
     }
   } catch (e) {}
+
+  broadcastStatsUpdate();
 
   res.writeHead(200, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -963,7 +1141,7 @@ async function handleTestDoHRequest(req, res) {
       answers: (decoded.answers || []).map(a => ({
         name: a.name,
         type: a.type,
-        ttl: a.ttl || 300,
+        ttl: a.ttl,
         data: a.data || (a.ip ? a.ip : '')
       }))
     }, null, 2));
@@ -974,15 +1152,17 @@ async function handleTestDoHRequest(req, res) {
     });
     res.end(JSON.stringify({
       success: false,
-      domain: name,
-      type,
       error: err.message
     }));
   }
 }
 
-// Apple iOS / macOS Encrypted DNS Profile (.mobileconfig)
-function generateMobileConfig(host = 'localhost:3000') {
+// Generate Apple iOS/macOS Encrypted DNS MobileConfig Profile
+function generateMobileConfig(host) {
+  const profileUuid = '8E5531B4-3701-4475-8D8F-D0304677A0F1';
+  const payloadUuid = '165F3480-1BF8-406C-8CE1-58A9F1A46DF8';
+  const dohUrl = `https://${host}/dns-query`;
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -995,41 +1175,41 @@ function generateMobileConfig(host = 'localhost:3000') {
                 <key>DNSProtocol</key>
                 <string>HTTPS</string>
                 <key>ServerURL</key>
-                <string>https://${host}/dns-query</string>
+                <string>${dohUrl}</string>
                 <key>ServerAddresses</key>
                 <array>
-                    <string>8.8.8.8</string>
                     <string>1.1.1.1</string>
+                    <string>8.8.8.8</string>
+                    <string>1.0.0.1</string>
+                    <string>8.8.4.4</string>
                 </array>
             </dict>
             <key>PayloadDescription</key>
-            <string>Cau hinh DNS over HTTPS bao mat va toc do cao</string>
+            <string>Cấu hình DNS-over-HTTPS (DoH) Antigravity Proxy với kết nối dự phòng IPv4 bootstrap.</string>
             <key>PayloadDisplayName</key>
-            <string>Antigravity DoH (${host})</string>
+            <string>Antigravity DoH Security</string>
             <key>PayloadIdentifier</key>
-            <string>com.antigravity.doh.${host.replace(/[^a-zA-Z0-9]/g, '.')}</string>
+            <string>com.antigravity.doh.dns.${payloadUuid}</string>
             <key>PayloadType</key>
             <string>com.apple.dnsSettings.managed</string>
             <key>PayloadUUID</key>
-            <string>8f12a14e-4e4b-4b2a-9285-d72b2204bc99</string>
+            <string>${payloadUuid}</string>
             <key>PayloadVersion</key>
             <integer>1</integer>
         </dict>
     </array>
     <key>PayloadDescription</key>
-    <string>Cau hinh tu dong ma hoa toan bo truy van DNS cho iPhone va Mac</string>
+    <string>Mã hóa và tăng tốc phân giải tên miền DoH thông qua Antigravity DoH Proxy.</string>
     <key>PayloadDisplayName</key>
-    <string>Antigravity DoH - ${host}</string>
+    <string>Antigravity DoH Proxy (Ultra Speed &amp; Resilient)</string>
     <key>PayloadIdentifier</key>
-    <string>com.antigravity.profile.${host.replace(/[^a-zA-Z0-9]/g, '.')}</string>
-    <key>PayloadOrganization</key>
-    <string>Antigravity Network</string>
+    <string>com.antigravity.doh.profile.${profileUuid}</string>
     <key>PayloadRemovalDisallowed</key>
     <false/>
     <key>PayloadType</key>
     <string>Configuration</string>
     <key>PayloadUUID</key>
-    <string>3b2f568a-c60a-4fa8-b21a-6d6545cf1888</string>
+    <string>${profileUuid}</string>
     <key>PayloadVersion</key>
     <integer>1</integer>
 </dict>
@@ -1042,12 +1222,12 @@ function handleProfileRequest(req, res) {
   res.writeHead(200, {
     'Content-Type': 'application/x-apple-aspen-config; charset=utf-8',
     'Content-Disposition': 'attachment; filename="Antigravity-DoH.mobileconfig"',
-    'Cache-Control': 'no-cache'
+    'Access-Control-Allow-Origin': '*'
   });
   res.end(xml);
 }
 
-// Modern Web Dashboard UI (Pure CSS & Vanilla JS, Fast & Responsive)
+// Render Modern Dashboard HTML with Live SSE & Real-Time Log Feed
 function renderDashboardHtml(req) {
   const host = req.headers.host || 'localhost:3000';
   const dohUrl = `https://${host}/dns-query`;
@@ -1058,21 +1238,22 @@ function renderDashboardHtml(req) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Antigravity DoH — DNS over HTTPS Proxy</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220%22><text y=%2226%22 font-size=%2226%22>⚡</text></svg>">
+    <title>Antigravity DoH Proxy — Cập nhật Realtime & Sửa Lỗi Gói Tin</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220%22%22><text y=%2226%22 font-size=%2224%22>⚡</text></svg>">
     <style>
         :root {
+            --bg: #030712;
+            --surface: #0f172a;
+            --surface-border: #1e293b;
             --primary: #38bdf8;
-            --primary-dark: #0284c7;
+            --primary-hover: #0ea5e9;
             --accent: #818cf8;
-            --surface-bg: #0b0f19;
-            --surface-card: #111827;
-            --surface-border: #1f293d;
-            --text-main: #f8fafc;
-            --text-muted: #94a3b8;
             --color-healthy: #10b981;
             --color-warning: #f59e0b;
             --color-danger: #ef4444;
+            --color-purple: #c084fc;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
         }
 
         * {
@@ -1083,18 +1264,18 @@ function renderDashboardHtml(req) {
 
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background-color: var(--surface-bg);
+            background-color: var(--bg);
             color: var(--text-main);
             line-height: 1.5;
-            padding: 20px;
+            padding: 24px 16px;
         }
 
         .container {
-            max-width: 1000px;
+            max-width: 1200px;
             margin: 0 auto;
             display: flex;
             flex-direction: column;
-            gap: 20px;
+            gap: 24px;
         }
 
         /* Header */
@@ -1102,68 +1283,72 @@ function renderDashboardHtml(req) {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            background: var(--surface-card);
-            border: 1px solid var(--surface-border);
-            padding: 20px 24px;
-            border-radius: 16px;
             flex-wrap: wrap;
-            gap: 15px;
+            gap: 16px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid var(--surface-border);
         }
 
         .brand {
             display: flex;
             align-items: center;
-            gap: 14px;
+            gap: 12px;
         }
 
         .brand-icon {
             font-size: 2.2rem;
-            background: linear-gradient(135deg, #38bdf8, #818cf8);
+            background: linear-gradient(135deg, var(--primary), var(--accent));
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
 
         .brand-text h1 {
-            font-size: 1.45rem;
+            font-size: 1.6rem;
             font-weight: 800;
             letter-spacing: -0.02em;
         }
 
         .brand-text p {
-            font-size: 0.85rem;
+            font-size: 0.88rem;
             color: var(--text-muted);
         }
 
         .badge-live {
-            display: flex;
+            display: inline-flex;
             align-items: center;
-            gap: 8px;
-            background: rgba(16, 185, 129, 0.1);
+            gap: 6px;
+            background: rgba(16, 185, 129, 0.15);
             color: var(--color-healthy);
-            border: 1px solid rgba(16, 185, 129, 0.25);
             padding: 6px 14px;
             border-radius: 9999px;
             font-size: 0.82rem;
             font-weight: 600;
+            border: 1px solid rgba(16, 185, 129, 0.3);
         }
 
         .pulse-dot {
             width: 8px;
             height: 8px;
             border-radius: 50%;
-            background: var(--color-healthy);
-            box-shadow: 0 0 10px var(--color-healthy);
+            background-color: var(--color-healthy);
+            animation: pulse 1.5s infinite;
         }
 
-        /* iOS Hero Card */
+        @keyframes pulse {
+            0% { transform: scale(0.95); opacity: 0.8; }
+            50% { transform: scale(1.3); opacity: 1; }
+            100% { transform: scale(0.95); opacity: 0.8; }
+        }
+
+        /* 1-Click iOS Banner */
         .ios-banner {
-            background: linear-gradient(135deg, #1e1b4b 0%, #172554 100%);
-            border: 1px solid #4338ca;
-            border-radius: 16px;
-            padding: 24px;
+            background: linear-gradient(135deg, rgba(56, 189, 248, 0.12), rgba(129, 140, 248, 0.1));
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            border-radius: 12px;
+            padding: 20px;
             display: flex;
             flex-direction: column;
-            gap: 16px;
+            gap: 14px;
         }
 
         .ios-banner-header {
@@ -1175,61 +1360,62 @@ function renderDashboardHtml(req) {
         }
 
         .ios-banner-title {
-            font-size: 1.25rem;
-            font-weight: 700;
-            color: #fff;
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 10px;
+            font-size: 1.15rem;
+            font-weight: 700;
+            color: #fff;
         }
 
         .btn-ios {
-            background: #38bdf8;
-            color: #0b0f19;
+            background: linear-gradient(135deg, #0284c7, #6366f1);
+            color: #fff;
+            text-decoration: none;
+            padding: 10px 20px;
+            border-radius: 8px;
             font-weight: 700;
             font-size: 0.95rem;
-            padding: 12px 22px;
-            border-radius: 10px;
-            text-decoration: none;
             display: inline-flex;
             align-items: center;
             gap: 8px;
-            transition: all 0.2s;
-            box-shadow: 0 4px 14px rgba(56, 189, 248, 0.35);
+            transition: all 0.2s ease;
+            box-shadow: 0 4px 12px rgba(2, 132, 199, 0.3);
         }
 
         .btn-ios:hover {
-            background: #7dd3fc;
+            opacity: 0.95;
             transform: translateY(-1px);
         }
 
         .steps-container {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-            gap: 14px;
+            gap: 12px;
+            background: rgba(0, 0, 0, 0.25);
+            padding: 14px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
         }
 
         .step-item {
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 10px;
-            padding: 14px;
-            font-size: 0.88rem;
-            color: #cbd5e1;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            line-height: 1.4;
         }
 
         .step-item strong {
-            display: block;
             color: #fff;
-            margin-bottom: 4px;
+            display: block;
+            margin-bottom: 2px;
         }
 
         /* URL Card */
         .url-card {
-            background: var(--surface-card);
+            background: var(--surface);
             border: 1px solid var(--surface-border);
-            border-radius: 16px;
-            padding: 20px 24px;
+            border-radius: 12px;
+            padding: 20px;
             display: flex;
             flex-direction: column;
             gap: 14px;
@@ -1239,67 +1425,68 @@ function renderDashboardHtml(req) {
             display: flex;
             justify-content: space-between;
             align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
         }
 
         .url-card-header h2 {
-            font-size: 1.15rem;
+            font-size: 1.05rem;
             font-weight: 700;
-            color: #fff;
         }
 
         .url-box {
+            display: flex;
+            align-items: center;
             background: #080c14;
             border: 1px solid #1e293b;
-            border-radius: 10px;
-            padding: 14px 18px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 10px;
+            border-radius: 8px;
+            padding: 10px 14px;
             font-family: monospace;
-            font-size: 1.05rem;
+            font-size: 0.95rem;
             color: var(--primary);
             overflow-x: auto;
+            word-break: break-all;
+            justify-content: space-between;
+            gap: 12px;
         }
 
         .btn-copy {
-            background: rgba(56, 189, 248, 0.15);
-            border: 1px solid rgba(56, 189, 248, 0.3);
-            color: var(--primary);
-            padding: 8px 16px;
-            border-radius: 8px;
+            background: var(--surface-border);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: #fff;
+            padding: 6px 14px;
+            border-radius: 6px;
             cursor: pointer;
-            font-weight: 600;
             font-size: 0.85rem;
+            font-weight: 600;
             white-space: nowrap;
             transition: all 0.2s;
         }
 
         .btn-copy:hover {
-            background: var(--primary);
-            color: #000;
+            background: rgba(56, 189, 248, 0.2);
+            border-color: var(--primary);
         }
 
         /* Stats Grid */
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 15px;
+            gap: 16px;
         }
 
         .stat-card {
-            background: var(--surface-card);
+            background: var(--surface);
             border: 1px solid var(--surface-border);
-            border-radius: 14px;
+            border-radius: 12px;
             padding: 18px;
             display: flex;
             flex-direction: column;
             gap: 6px;
-            position: relative;
         }
 
         .stat-label {
-            font-size: 0.8rem;
+            font-size: 0.82rem;
             color: var(--text-muted);
             text-transform: uppercase;
             letter-spacing: 0.05em;
@@ -1307,36 +1494,40 @@ function renderDashboardHtml(req) {
         }
 
         .stat-value {
-            font-size: 1.7rem;
+            font-size: 1.85rem;
             font-weight: 800;
             color: #fff;
+            display: flex;
+            align-items: baseline;
+            gap: 4px;
         }
 
         .stat-unit {
-            font-size: 0.9rem;
+            font-size: 0.95rem;
+            font-weight: 500;
             color: var(--text-muted);
-            font-weight: normal;
-            margin-left: 4px;
         }
 
         /* Main Panels */
         .main-panel {
-            background: var(--surface-card);
+            background: var(--surface);
             border: 1px solid var(--surface-border);
-            border-radius: 16px;
-            padding: 24px;
+            border-radius: 12px;
+            padding: 20px;
             display: flex;
             flex-direction: column;
-            gap: 18px;
+            gap: 16px;
         }
 
         .main-panel h2 {
-            font-size: 1.25rem;
+            font-size: 1.15rem;
             font-weight: 700;
-            color: #fff;
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
 
-        /* Tester Component */
+        /* Tester Bar */
         .tester-bar {
             display: flex;
             gap: 10px;
@@ -1345,7 +1536,7 @@ function renderDashboardHtml(req) {
 
         .tester-input {
             flex: 1;
-            min-width: 200px;
+            min-width: 220px;
             background: #080c14;
             border: 1px solid #1e293b;
             border-radius: 8px;
@@ -1441,12 +1632,22 @@ function renderDashboardHtml(req) {
             font-weight: 700;
         }
 
-        .toast-msg {
-            display: inline-block;
-            margin-left: 10px;
+        .badge-cache {
+            background: rgba(16, 185, 129, 0.15);
             color: var(--color-healthy);
-            font-size: 0.85rem;
-            transition: opacity 0.3s;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 700;
+        }
+
+        .badge-repair {
+            background: rgba(192, 132, 252, 0.2);
+            color: var(--color-purple);
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 700;
         }
     </style>
 </head>
@@ -1458,13 +1659,13 @@ function renderDashboardHtml(req) {
                 <div class="brand-icon">⚡</div>
                 <div class="brand-text">
                     <h1>Antigravity DoH Proxy</h1>
-                    <p>Máy chủ DNS-over-HTTPS tốc độ cao — Chia tải thông minh & Ổn định tuyệt đối</p>
+                    <p>Cập nhật Realtime SSE &bull; Tự sửa lỗi gói tin &bull; Tăng tốc phân giải</p>
                 </div>
             </div>
             <div style="display: flex; align-items: center; gap: 10px;">
-                <div class="badge-live">
+                <div class="badge-live" id="stream-status-badge">
                     <div class="pulse-dot"></div>
-                    Kết nối Ổn định
+                    <span id="stream-status-text">Realtime Live</span>
                 </div>
                 <button class="btn-copy" style="font-size: 0.75rem; padding: 4px 10px;" onclick="resetStatsCounter()">Xóa bộ đếm</button>
             </div>
@@ -1501,7 +1702,7 @@ function renderDashboardHtml(req) {
         <div class="url-card">
             <div class="url-card-header">
                 <h2>🌐 Địa chỉ DoH RFC 8484 (Cài đặt thủ công)</h2>
-                <span style="font-size: 0.85rem; color: var(--text-muted);">Hỗ trợ GET / POST RFC 8484 & JSON</span>
+                <span style="font-size: 0.85rem; color: var(--text-muted);">Hỗ trợ GET / POST RFC 8484, JSON & Stream SSE</span>
             </div>
             <div class="url-box">
                 <span id="doh-url">${dohUrl}</span>
@@ -1520,12 +1721,16 @@ function renderDashboardHtml(req) {
                 <span class="stat-value" id="total-queries">0</span>
             </div>
             <div class="stat-card">
-                <span class="stat-label">Tỷ lệ Trúng Cache (RAM)</span>
+                <span class="stat-label">Trúng Cache (RAM)</span>
                 <span class="stat-value" id="cache-hit-rate">0<span class="stat-unit">%</span></span>
             </div>
             <div class="stat-card">
-                <span class="stat-label">Trúng Bộ Đệm SWR</span>
+                <span class="stat-label">Bộ Đệm SWR</span>
                 <span class="stat-value" id="swr-hits">0</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Gói Tin Tự Sửa</span>
+                <span class="stat-value" id="repaired-packets" style="color: var(--color-purple);">0</span>
             </div>
             <div class="stat-card">
                 <span class="stat-label">Độ trễ trung bình</span>
@@ -1553,6 +1758,31 @@ function renderDashboardHtml(req) {
             <div id="test-result-box" class="test-result-box">
                 <div id="test-result-meta" style="color: var(--primary); margin-bottom: 8px; font-weight: 600;"></div>
                 <div id="test-result-pre"></div>
+            </div>
+        </div>
+
+        <!-- Real-Time Live Queries Log Stream -->
+        <div class="main-panel">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+                <h2>⚡ Dòng truy vấn Trực tiếp (Live Query Stream)</h2>
+                <span style="font-size: 0.85rem; color: var(--text-muted);">Cập nhật tức thời qua Server-Sent Events</span>
+            </div>
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Thời gian</th>
+                            <th>Tên miền</th>
+                            <th>Loại</th>
+                            <th>Phản hồi bởi</th>
+                            <th>Độ trễ</th>
+                            <th>Trạng thái</th>
+                        </tr>
+                    </thead>
+                    <tbody id="recent-queries-body">
+                        <tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 20px;">Đang kết nối luồng dữ liệu realtime...</td></tr>
+                    </tbody>
+                </table>
             </div>
         </div>
 
@@ -1597,51 +1827,104 @@ function renderDashboardHtml(req) {
         let localTotal = parseInt(localStorage.getItem('antigravity_total_queries') || '0', 10);
         let localHits = parseInt(localStorage.getItem('antigravity_cache_hits') || '0', 10);
         let localSwr = parseInt(localStorage.getItem('antigravity_swr_hits') || '0', 10);
+        let localRepaired = parseInt(localStorage.getItem('antigravity_repaired') || '0', 10);
+
+        function updateUI(data) {
+            if (!data) return;
+
+            localTotal = Math.max(localTotal, data.totalQueries || 0);
+            localHits = Math.max(localHits, data.cacheHits || 0);
+            localSwr = Math.max(localSwr, data.swrHits || 0);
+            localRepaired = Math.max(localRepaired, data.repairedPackets || 0);
+
+            localStorage.setItem('antigravity_total_queries', localTotal);
+            localStorage.setItem('antigravity_cache_hits', localHits);
+            localStorage.setItem('antigravity_swr_hits', localSwr);
+            localStorage.setItem('antigravity_repaired', localRepaired);
+
+            document.getElementById('total-queries').innerText = localTotal.toLocaleString();
+            const hitRate = localTotal > 0 ? Math.round((localHits / localTotal) * 100) : 0;
+            document.getElementById('cache-hit-rate').innerHTML = hitRate + '<span class="stat-unit">%</span>';
+            document.getElementById('swr-hits').innerText = localSwr.toLocaleString();
+            document.getElementById('repaired-packets').innerText = localRepaired.toLocaleString();
+            document.getElementById('avg-latency').innerHTML = (data.averageLatency || 15) + '<span class="stat-unit">ms</span>';
+            document.getElementById('pool-size').innerHTML = (data.poolSize || 3) + '<span class="stat-unit">máy chủ</span>';
+
+            // Upstreams Leaderboard
+            const tbody = document.getElementById('dns-table-body');
+            if (data.upstreams && data.upstreams.length > 0) {
+                tbody.innerHTML = data.upstreams.map(u => {
+                    const isHealthy = u.status === 'Healthy';
+                    return '<tr>' +
+                        '<td><strong>' + escapeHtml(u.name) + '</strong></td>' +
+                        '<td><code>' + escapeHtml(u.ip) + '</code></td>' +
+                        '<td><span style="color: ' + (isHealthy ? 'var(--color-healthy)' : 'var(--color-warning)') + '; font-weight: 700;">' + (u.realAvgLatency || u.avgLatency || 20) + ' ms</span></td>' +
+                        '<td><span class="status-dot status-' + u.status + '"></span>' + u.status + '</td>' +
+                        '<td><span class="badge-winner">' + (u.routedQueries || 0) + ' truy vấn</span></td>' +
+                    '</tr>';
+                }).join('');
+            }
+
+            // Real-Time Query Logs Table
+            const recentBody = document.getElementById('recent-queries-body');
+            if (data.recentQueries && data.recentQueries.length > 0) {
+                recentBody.innerHTML = data.recentQueries.map(q => {
+                    const timeStr = new Date(q.timestamp).toLocaleTimeString();
+                    let badgeClass = 'badge-winner';
+                    if (q.status.includes('Cache') || q.status.includes('SWR')) badgeClass = 'badge-cache';
+                    if (q.status.includes('Repaired')) badgeClass = 'badge-repair';
+
+                    return '<tr>' +
+                        '<td style="color: var(--text-muted); font-size: 0.85rem;">' + timeStr + '</td>' +
+                        '<td><strong>' + escapeHtml(q.domain) + '</strong></td>' +
+                        '<td><code>' + escapeHtml(q.type) + '</code></td>' +
+                        '<td>' + escapeHtml(q.upstreamName) + '</td>' +
+                        '<td style="font-weight: 600; color: ' + (q.latency < 25 ? 'var(--color-healthy)' : 'var(--text-main)') + ';">' + q.latency + 'ms</td>' +
+                        '<td><span class="' + badgeClass + '">' + escapeHtml(q.status) + '</span></td>' +
+                    '</tr>';
+                }).join('');
+            }
+        }
 
         async function fetchStats() {
             try {
                 const res = await fetch('/api/stats');
                 if (!res.ok) return;
                 const data = await res.json();
-
-                localTotal = Math.max(localTotal, data.totalQueries || 0);
-                localHits = Math.max(localHits, data.cacheHits || 0);
-                localSwr = Math.max(localSwr, data.swrHits || 0);
-
-                localStorage.setItem('antigravity_total_queries', localTotal);
-                localStorage.setItem('antigravity_cache_hits', localHits);
-                localStorage.setItem('antigravity_swr_hits', localSwr);
-
-                document.getElementById('total-queries').innerText = localTotal.toLocaleString();
-                const hitRate = localTotal > 0 ? Math.round((localHits / localTotal) * 100) : 0;
-                document.getElementById('cache-hit-rate').innerHTML = hitRate + '<span class="stat-unit">%</span>';
-                document.getElementById('swr-hits').innerText = localSwr.toLocaleString();
-                document.getElementById('avg-latency').innerHTML = (data.averageLatency || 15) + '<span class="stat-unit">ms</span>';
-                document.getElementById('pool-size').innerHTML = (data.poolSize || 3) + '<span class="stat-unit">máy chủ</span>';
-
-                const tbody = document.getElementById('dns-table-body');
-                if (data.upstreams && data.upstreams.length > 0) {
-                    tbody.innerHTML = data.upstreams.map(u => {
-                        const isHealthy = u.status === 'Healthy';
-                        return '<tr>' +
-                            '<td><strong>' + escapeHtml(u.name) + '</strong></td>' +
-                            '<td><code>' + escapeHtml(u.ip) + '</code></td>' +
-                            '<td><span style="color: ' + (isHealthy ? 'var(--color-healthy)' : 'var(--color-warning)') + '; font-weight: 700;">' + (u.realAvgLatency || u.avgLatency || 20) + ' ms</span></td>' +
-                            '<td><span class="status-dot status-' + u.status + '"></span>' + u.status + '</td>' +
-                            '<td><span class="badge-winner">' + (u.routedQueries || 0) + ' truy vấn</span></td>' +
-                        '</tr>';
-                    }).join('');
-                }
+                updateUI(data);
             } catch (err) {}
+        }
+
+        // Live Real-Time Connection with Server-Sent Events (SSE) + Auto-Reconnect & Fallback
+        function initRealtimeStream() {
+            if (window.EventSource) {
+                const es = new EventSource('/api/stream');
+                es.onopen = () => {
+                    document.getElementById('stream-status-text').innerText = 'Realtime Live';
+                };
+                es.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        updateUI(data);
+                    } catch (e) {}
+                };
+                es.onerror = () => {
+                    document.getElementById('stream-status-text').innerText = 'Đang đồng bộ';
+                    es.close();
+                    setTimeout(initRealtimeStream, 3000);
+                };
+            }
         }
 
         async function resetStatsCounter() {
             localTotal = 0;
             localHits = 0;
             localSwr = 0;
+            localRepaired = 0;
             localStorage.removeItem('antigravity_total_queries');
             localStorage.removeItem('antigravity_cache_hits');
             localStorage.removeItem('antigravity_swr_hits');
+            localStorage.removeItem('antigravity_repaired');
             try {
                 await fetch('/api/reset-stats', { method: 'POST' });
             } catch (e) {}
@@ -1687,7 +1970,8 @@ function renderDashboardHtml(req) {
         }
 
         fetchStats();
-        setInterval(fetchStats, 3000);
+        initRealtimeStream();
+        setInterval(fetchStats, 2000);
     </script>
 </body>
 </html>`;
@@ -1741,22 +2025,27 @@ const handler = async (req, res) => {
     return handleStatsRequest(req, res);
   }
 
-  // 4. Reset stats
+  // 4. Real-time Server-Sent Events stream
+  if (pathname === '/api/stream') {
+    return handleStreamRequest(req, res);
+  }
+
+  // 5. Reset stats
   if (pathname === '/api/reset-stats') {
     return handleResetStatsRequest(req, res);
   }
 
-  // 5. Test DoH
+  // 6. Test DoH
   if (pathname === '/api/test-doh') {
     return handleTestDoHRequest(req, res);
   }
 
-  // 6. Apple iOS/macOS Encrypted DNS Profile (.mobileconfig)
+  // 7. Apple iOS/macOS Encrypted DNS Profile (.mobileconfig)
   if (pathname === '/profile.mobileconfig' || pathname === '/api/profile') {
     return handleProfileRequest(req, res);
   }
 
-  // 7. Default: Serve Web Dashboard
+  // 8. Default: Serve Web Dashboard
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(renderDashboardHtml(req));
 };
@@ -1822,10 +2111,13 @@ module.exports = {
   handleDoHRequest,
   handlePingRequest,
   handleStatsRequest,
+  handleStreamRequest,
   handleResetStatsRequest,
   handleTestDoHRequest,
   handleProfileRequest,
   generateMobileConfig,
-  handleDoH
+  handleDoH,
+  repairAndNormalizeDnsQuery,
+  repairDnsResponse
 };
 module.exports.default = handler;
