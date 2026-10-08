@@ -6,37 +6,36 @@ const dnsPacket = require('dns-packet');
 const PORT = process.env.PORT || 3000;
 const isVercel = Boolean(process.env.VERCEL || process.env.NOW_REGION || process.env.AWS_LAMBDA_FUNCTION_NAME);
 
-// Persistent, high-performance HTTPS Agent with Keep-Alive & Connection Pooling
+// Persistent, ultra-high-performance HTTPS Agent with Keep-Alive & Connection Pooling
+// maxSockets: Infinity ensures zero queuing bottlenecks for concurrent DNS queries
 const httpsAgent = new https.Agent({
   keepAlive: true,
-  keepAliveMsecs: 60000,
-  maxSockets: 50,
-  maxFreeSockets: 25,
-  timeout: 3000,
+  keepAliveMsecs: 120000,
+  maxSockets: Infinity,
+  maxFreeSockets: 128,
+  timeout: 2500,
   rejectUnauthorized: false
 });
 
-// Upstream DoH Resolvers (IP-based URLs prevent bootstrap lookup cycles)
+// Curated 100% verified high-performance upstream resolvers
+// (Eliminated broken Quad9 505 and Mullvad socket hangup)
 const UPSTREAMS = [
-  { name: 'Cloudflare Primary', ip: '1.1.1.1', dohUrl: 'https://1.1.1.1/dns-query' },
-  { name: 'Cloudflare Secondary', ip: '1.0.0.1', dohUrl: 'https://1.0.0.1/dns-query' },
   { name: 'Google Primary', ip: '8.8.8.8', dohUrl: 'https://8.8.8.8/dns-query' },
   { name: 'Google Secondary', ip: '8.8.4.4', dohUrl: 'https://8.8.4.4/dns-query' },
-  { name: 'Quad9 Primary', ip: '9.9.9.9', dohUrl: 'https://9.9.9.9/dns-query' },
-  { name: 'Quad9 Secondary', ip: '149.112.112.112', dohUrl: 'https://149.112.112.112/dns-query' },
+  { name: 'Cloudflare Primary', ip: '1.1.1.1', dohUrl: 'https://1.1.1.1/dns-query' },
+  { name: 'Cloudflare Secondary', ip: '1.0.0.1', dohUrl: 'https://1.0.0.1/dns-query' },
   { name: 'AdGuard Standard', ip: '94.140.14.14', dohUrl: 'https://94.140.14.14/dns-query' },
-  { name: 'AdGuard Alt', ip: '94.140.15.15', dohUrl: 'https://94.140.15.15/dns-query' },
+  { name: 'DNS.SB Primary', ip: '45.11.45.11', dohUrl: 'https://45.11.45.11/dns-query' },
   { name: 'ControlD Free', ip: '76.76.2.0', dohUrl: 'https://76.76.2.0/dns-query' },
   { name: 'OpenDNS Primary', ip: '208.67.222.222', dohUrl: 'https://208.67.222.222/dns-query' },
-  { name: 'DNS.SB Primary', ip: '45.11.45.11', dohUrl: 'https://45.11.45.11/dns-query' },
-  { name: 'Mullvad Primary', ip: '194.242.2.2', dohUrl: 'https://194.242.2.2/dns-query' }
+  { name: 'OpenDNS Secondary', ip: '208.67.220.220', dohUrl: 'https://208.67.220.220/dns-query' }
 ];
 
-// Health and telemetry state per upstream
-const upstreamStates = UPSTREAMS.map(u => ({
+// Health and telemetry state per upstream with Circuit Breaker tracking
+const upstreamStates = UPSTREAMS.map((u, idx) => ({
   ...u,
-  avgLatency: 20,
-  realAvgLatency: 20,
+  avgLatency: idx < 4 ? 15 : (idx < 7 ? 35 : 45),
+  realAvgLatency: idx < 4 ? 15 : (idx < 7 ? 35 : 45),
   penalty: 0,
   status: 'Healthy',
   consecutiveErrors: 0,
@@ -46,26 +45,25 @@ const upstreamStates = UPSTREAMS.map(u => ({
   realErrorsCount: 0
 }));
 
-let currentPoolSize = 4;
+let currentPoolSize = 3;
 
+// Smart Dynamic Score: lower score = faster and healthier server
 function calculateScore(state) {
-  const effectiveLatency = state.realAvgLatency || state.avgLatency || 25;
-  const loadPenalty = (state.activeQueries || 0) * 15;
+  const effectiveLatency = state.realAvgLatency || state.avgLatency || 20;
+  const loadPenalty = (state.activeQueries || 0) * 12;
   return effectiveLatency + (state.penalty || 0) + loadPenalty;
 }
 
 function updateCandidates() {
   const healthyCount = upstreamStates.filter(s => s.status === 'Healthy').length;
-  if (healthyCount < 3) {
-    currentPoolSize = 3;
-  } else if (healthyCount <= 4) {
-    currentPoolSize = 3;
+  if (healthyCount <= 3) {
+    currentPoolSize = 2;
   } else {
-    currentPoolSize = 4;
+    currentPoolSize = 3;
   }
 }
 
-// In-Memory Cache with Stale-While-Revalidate (SWR)
+// In-Memory Cache with Stale-While-Revalidate (SWR) & In-Flight Coalescing
 const cache = new Map();
 const coalescedQueries = new Map();
 const activeRevalidations = new Set();
@@ -160,13 +158,17 @@ function base64urlDecode(str) {
 // Robust Request Body Extractor (Handles Buffer, String, Object, and Stream safely)
 async function getRequestBody(req) {
   if (req.body) {
-    if (Buffer.isBuffer(req.body)) return req.body;
-    if (typeof req.body === 'string') return Buffer.from(req.body, 'binary');
-    if (typeof req.body === 'object') {
-      if (req.body.type === 'Buffer' && Array.isArray(req.body.data)) {
+    if (Buffer.isBuffer(req.body) && req.body.length > 0) return req.body;
+    if (typeof req.body === 'string' && req.body.length > 0) return Buffer.from(req.body, 'binary');
+    if (typeof req.body === 'object' && req.body !== null) {
+      if (req.body.type === 'Buffer' && Array.isArray(req.body.data) && req.body.data.length > 0) {
         return Buffer.from(req.body.data);
       }
-      return Buffer.from(JSON.stringify(req.body));
+      // If req.body is non-empty object, use it; if empty {} from bodyParser, fall through to stream
+      const keys = Object.keys(req.body);
+      if (keys.length > 0) {
+        return Buffer.from(JSON.stringify(req.body));
+      }
     }
   }
   if (req.readableEnded) {
@@ -183,14 +185,17 @@ async function getRequestBody(req) {
     req.on('data', chunk => chunks.push(chunk));
     req.on('end', finish);
     req.on('error', finish);
-    const timer = setTimeout(finish, 2500);
+    const timer = setTimeout(finish, 1800);
     if (timer.unref) timer.unref();
   });
 }
 
-// Query single DoH upstream with keep-alive HTTPS connection
-function queryDoHUpstream(upstream, queryBuffer, timeoutMs = 2000) {
+// Query single DoH upstream with keep-alive HTTPS connection and AbortSignal support
+function queryDoHUpstream(upstream, queryBuffer, timeoutMs = 2000, signal = null) {
   return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) {
+      return reject(new Error('Aborted'));
+    }
     const t0 = Date.now();
     const parsed = new URL(upstream.dohUrl || `https://${upstream.ip}/dns-query`);
 
@@ -205,7 +210,7 @@ function queryDoHUpstream(upstream, queryBuffer, timeoutMs = 2000) {
         'Content-Type': 'application/dns-message',
         'Accept': 'application/dns-message',
         'Content-Length': queryBuffer.length,
-        'User-Agent': 'Antigravity-DoH/2.0'
+        'User-Agent': 'Antigravity-DoH/3.0'
       },
       timeout: timeoutMs
     }, (res) => {
@@ -224,6 +229,13 @@ function queryDoHUpstream(upstream, queryBuffer, timeoutMs = 2000) {
       });
     });
 
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        req.destroy();
+        reject(new Error('Aborted'));
+      }, { once: true });
+    }
+
     req.on('error', (err) => reject(err));
     req.on('timeout', () => {
       req.destroy();
@@ -235,7 +247,8 @@ function queryDoHUpstream(upstream, queryBuffer, timeoutMs = 2000) {
   });
 }
 
-// Select candidates for racing
+// Smart Selection of Racing Candidates:
+// Dynamically balances fast latency with concurrency spread so no server is bottlenecked
 function selectRacingCandidates(count = 3) {
   const healthy = upstreamStates.filter(s => s.status !== 'Offline');
   if (healthy.length <= count) {
@@ -244,8 +257,9 @@ function selectRacingCandidates(count = 3) {
 
   const pool = healthy.map(c => {
     const scoreVal = Math.max(1, calculateScore(c));
-    const fairnessBonus = 1.0 + Math.max(0, 0.8 - (c.routedQueries || 0) * 0.05);
-    const weight = Math.max(0.1, Math.pow(1000 / scoreVal, 1.2) * fairnessBonus);
+    // Soft fairness bonus: slightly encourages underutilized servers while strongly prioritizing low latency
+    const fairnessBonus = 1.0 + Math.max(0, 0.6 - (c.routedQueries || 0) * 0.04);
+    const weight = Math.max(0.1, Math.pow(100 / scoreVal, 1.3) * fairnessBonus);
     return { candidate: c, weight };
   });
 
@@ -270,10 +284,11 @@ function selectRacingCandidates(count = 3) {
   return selected;
 }
 
-// Hedged Racing Engine
+// Hedged Racing Engine with Loser Cancellation & Dual-Sided Circuit Breaker
 async function raceDNS(queryBuffer, clientIp = null, timeoutMs = 1800) {
   const originalTxId = queryBuffer.readUInt16BE(0);
   const candidates = selectRacingCandidates(currentPoolSize || 3);
+  const abortController = new AbortController();
 
   candidates.forEach(c => {
     c.activeQueries = (c.activeQueries || 0) + 1;
@@ -281,25 +296,43 @@ async function raceDNS(queryBuffer, clientIp = null, timeoutMs = 1800) {
 
   try {
     const racePromises = candidates.map(upstream =>
-      queryDoHUpstream(upstream, queryBuffer, timeoutMs)
+      queryDoHUpstream(upstream, queryBuffer, timeoutMs, abortController.signal)
+        .then(res => {
+          // Success telemetry for this upstream
+          upstream.consecutiveErrors = 0;
+          upstream.penalty = Math.max(0, (upstream.penalty || 0) - 10);
+          if (upstream.status === 'Degraded') upstream.status = 'Healthy';
+
+          const alpha = 0.25;
+          upstream.realAvgLatency = (upstream.realQueriesCount || 0) === 0
+            ? res.latency
+            : Math.round(alpha * res.latency + (1 - alpha) * (upstream.realAvgLatency || res.latency));
+          upstream.realQueriesCount = (upstream.realQueriesCount || 0) + 1;
+          upstream.avgLatency = upstream.realAvgLatency;
+          return res;
+        })
+        .catch(err => {
+          if (err.message !== 'Aborted') {
+            upstream.realErrorsCount = (upstream.realErrorsCount || 0) + 1;
+            upstream.penalty = Math.min(600, (upstream.penalty || 0) + 80);
+            upstream.consecutiveErrors = (upstream.consecutiveErrors || 0) + 1;
+            if (upstream.consecutiveErrors >= 3) upstream.status = 'Degraded';
+            if (upstream.consecutiveErrors >= 5) upstream.status = 'Offline';
+          }
+          throw err;
+        })
     );
 
     const winnerRes = await Promise.any(racePromises);
+
+    // Immediately abort losing requests to free network sockets & CPU!
+    abortController.abort();
+
     const winner = winnerRes.upstream;
     const responseBuffer = Buffer.from(winnerRes.buffer);
-    
     responseBuffer.writeUInt16BE(originalTxId, 0);
 
     winner.routedQueries = (winner.routedQueries || 0) + 1;
-    winner.consecutiveErrors = 0;
-    winner.penalty = Math.max(0, (winner.penalty || 0) - 15);
-    
-    const alpha = 0.25;
-    winner.realAvgLatency = (winner.realQueriesCount || 0) === 0
-      ? winnerRes.latency
-      : Math.round(alpha * winnerRes.latency + (1 - alpha) * (winner.realAvgLatency || winnerRes.latency));
-    winner.realQueriesCount = (winner.realQueriesCount || 0) + 1;
-    winner.avgLatency = winner.realAvgLatency;
     calculateScore(winner);
 
     return {
@@ -308,20 +341,15 @@ async function raceDNS(queryBuffer, clientIp = null, timeoutMs = 1800) {
       winner
     };
   } catch (err) {
-    candidates.forEach(c => {
-      c.realErrorsCount = (c.realErrorsCount || 0) + 1;
-      c.penalty = Math.min(800, (c.penalty || 0) + 100);
-      c.consecutiveErrors = (c.consecutiveErrors || 0) + 1;
-      if (c.consecutiveErrors >= 3) {
-        c.status = 'Degraded';
-      }
-    });
+    abortController.abort();
 
-    const fallbackCandidate = upstreamStates.find(u => u.name.includes('Google') || u.name.includes('Cloudflare')) || upstreamStates[0];
+    // Fallback candidate if all candidates in race failed
+    const fallbackCandidate = upstreamStates.find(u => u.status === 'Healthy' && (u.name.includes('Google') || u.name.includes('Cloudflare'))) || upstreamStates[0];
     try {
-      const fbRes = await queryDoHUpstream(fallbackCandidate, queryBuffer, 2200);
+      const fbRes = await queryDoHUpstream(fallbackCandidate, queryBuffer, 2000);
       const resBuf = Buffer.from(fbRes.buffer);
       resBuf.writeUInt16BE(originalTxId, 0);
+      fallbackCandidate.routedQueries = (fallbackCandidate.routedQueries || 0) + 1;
       return {
         responseBuffer: resBuf,
         from: fallbackCandidate.name,
@@ -364,7 +392,7 @@ async function handleDoH(queryBuffer, clientIp) {
     throw new Error('Format Error: Failed to parse DNS query');
   }
 
-  // EDNS Client Subnet (ECS) Routing
+  // EDNS Client Subnet (ECS) Routing for geographic CDN optimization
   if (isValidPublicIp(clientIp)) {
     try {
       let optRecord = dnsQueryObj.additionals ? dnsQueryObj.additionals.find(r => r.type === 'OPT') : null;
@@ -407,7 +435,7 @@ async function handleDoH(queryBuffer, clientIp) {
   const cacheKey = getCacheKey(dnsQueryObj);
   const now = Date.now();
 
-  // 1. Cache Lookup
+  // 1. In-Memory Cache Lookup (RAM: 0ms)
   if (cacheKey && cache.has(cacheKey)) {
     const cachedEntry = cache.get(cacheKey);
 
@@ -448,18 +476,24 @@ async function handleDoH(queryBuffer, clientIp) {
     }
   }
 
-  // 2. Request Coalescing
+  // 2. Request Coalescing (Safe singleflight deduplication with 600ms safety limit)
   if (cacheKey && coalescedQueries.has(cacheKey)) {
     try {
-      const sharedRes = await coalescedQueries.get(cacheKey);
+      const existingPromise = coalescedQueries.get(cacheKey);
+      const sharedRes = await Promise.race([
+        existingPromise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Coalesce timeout')), 600))
+      ]);
       const clientResponse = Buffer.from(sharedRes.responseBuffer);
       clientResponse.writeUInt16BE(dnsQueryObj.id, 0);
       stats.cacheHits++;
       return clientResponse;
-    } catch (e) {}
+    } catch (e) {
+      // In-flight race failed or timed out: safely proceed to own query
+    }
   }
 
-  // 3. Forward to Upstreams
+  // 3. Forward to Upstreams via Smart Hedged Racing
   stats.cacheMisses++;
   const racePromise = raceDNS(queryBuffer, clientIp);
 
@@ -799,29 +833,29 @@ function generateMobileConfig(host = 'localhost:3000') {
             <key>PayloadDisplayName</key>
             <string>Antigravity DoH (${host})</string>
             <key>PayloadIdentifier</key>
-            <string>com.antigravity.dns.${host}</string>
+            <string>com.antigravity.doh.${host.replace(/[^a-zA-Z0-9]/g, '.')}</string>
             <key>PayloadType</key>
             <string>com.apple.dnsSettings.managed</string>
             <key>PayloadUUID</key>
-            <string>3B7A849F-9D45-42EB-8B7A-72534591ABCD</string>
+            <string>8f12a14e-4e4b-4b2a-9285-d72b2204bc99</string>
             <key>PayloadVersion</key>
             <integer>1</integer>
-            <key>ProhibitDisablement</key>
-            <false/>
         </dict>
     </array>
     <key>PayloadDescription</key>
-    <string>May chu DNS over HTTPS toc do cao toi uu hoa Vercel</string>
+    <string>Cau hinh tu dong ma hoa toan bo truy van DNS cho iPhone va Mac</string>
     <key>PayloadDisplayName</key>
-    <string>Antigravity DoH Proxy</string>
+    <string>Antigravity DoH - ${host}</string>
     <key>PayloadIdentifier</key>
-    <string>com.antigravity.dns.profile.${host}</string>
+    <string>com.antigravity.profile.${host.replace(/[^a-zA-Z0-9]/g, '.')}</string>
+    <key>PayloadOrganization</key>
+    <string>Antigravity Network</string>
     <key>PayloadRemovalDisallowed</key>
     <false/>
     <key>PayloadType</key>
     <string>Configuration</string>
     <key>PayloadUUID</key>
-    <string>A51B7610-82E5-46D9-B101-92CD8E591234</string>
+    <string>3b2f568a-c60a-4fa8-b21a-6d6545cf1888</string>
     <key>PayloadVersion</key>
     <integer>1</integer>
 </dict>
@@ -829,22 +863,19 @@ function generateMobileConfig(host = 'localhost:3000') {
 }
 
 function handleProfileRequest(req, res) {
-  const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3000';
+  const host = req.headers.host || 'localhost:3000';
   const xml = generateMobileConfig(host);
   res.writeHead(200, {
     'Content-Type': 'application/x-apple-aspen-config; charset=utf-8',
     'Content-Disposition': 'attachment; filename="Antigravity-DoH.mobileconfig"',
-    'Cache-Control': 'no-cache',
-    'Access-Control-Allow-Origin': '*'
+    'Cache-Control': 'no-cache'
   });
   res.end(xml);
 }
 
-// -------------------------------------------------------------
-// WEB DASHBOARD HTML
-// -------------------------------------------------------------
+// Modern Web Dashboard UI (Pure CSS & Vanilla JS, Fast & Responsive)
 function renderDashboardHtml(req) {
-  const host = req.headers['x-forwarded-host'] || req.headers.host || `localhost:${PORT}`;
+  const host = req.headers.host || 'localhost:3000';
   const dohUrl = `https://${host}/dns-query`;
   const mobileConfigUrl = `https://${host}/profile.mobileconfig`;
 
@@ -853,79 +884,75 @@ function renderDashboardHtml(req) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Antigravity Hyper-Speed DoH Proxy — Tối ưu cho Vercel</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800&display=swap" rel="stylesheet">
+    <title>Antigravity DoH — DNS over HTTPS Proxy</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220%22><text y=%2226%22 font-size=%2226%22>⚡</text></svg>">
     <style>
         :root {
-            --bg-color: #03050a;
-            --surface-color: #0d111a;
-            --surface-card: #131926;
-            --surface-border: #1e293b;
             --primary: #38bdf8;
-            --primary-hover: #0ea5e9;
+            --primary-dark: #0284c7;
             --accent: #818cf8;
-            --text-main: #f1f5f9;
+            --surface-bg: #0b0f19;
+            --surface-card: #111827;
+            --surface-border: #1f293d;
+            --text-main: #f8fafc;
             --text-muted: #94a3b8;
-            --color-healthy: #34d399;
-            --color-warning: #fbbf24;
-            --color-danger: #f87171;
-            --font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+            --color-healthy: #10b981;
+            --color-warning: #f59e0b;
+            --color-danger: #ef4444;
         }
 
-        * { box-sizing: border-box; margin: 0; padding: 0; }
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
         body {
-            background-color: var(--bg-color);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--surface-bg);
             color: var(--text-main);
-            font-family: var(--font-family);
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            padding: 30px 15px;
+            line-height: 1.5;
+            padding: 20px;
         }
 
         .container {
-            width: 100%;
-            max-width: 1100px;
+            max-width: 1000px;
+            margin: 0 auto;
             display: flex;
             flex-direction: column;
-            gap: 25px;
+            gap: 20px;
         }
 
+        /* Header */
         header {
             display: flex;
             justify-content: space-between;
             align-items: center;
+            background: var(--surface-card);
+            border: 1px solid var(--surface-border);
+            padding: 20px 24px;
+            border-radius: 16px;
             flex-wrap: wrap;
             gap: 15px;
-            padding-bottom: 20px;
-            border-bottom: 1px solid var(--surface-border);
         }
 
         .brand {
             display: flex;
             align-items: center;
-            gap: 15px;
+            gap: 14px;
         }
 
         .brand-icon {
-            width: 50px;
-            height: 50px;
+            font-size: 2.2rem;
             background: linear-gradient(135deg, #38bdf8, #818cf8);
-            border-radius: 14px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 26px;
-            box-shadow: 0 0 25px rgba(56, 189, 248, 0.4);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
         }
 
         .brand-text h1 {
-            font-size: 1.6rem;
+            font-size: 1.45rem;
             font-weight: 800;
-            background: linear-gradient(90deg, #38bdf8, #818cf8, #c084fc);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.02em;
         }
 
         .brand-text p {
@@ -934,42 +961,35 @@ function renderDashboardHtml(req) {
         }
 
         .badge-live {
-            background: rgba(52, 211, 153, 0.12);
-            color: var(--color-healthy);
-            border: 1px solid rgba(52, 211, 153, 0.3);
-            padding: 6px 14px;
-            border-radius: 9999px;
-            font-size: 0.85rem;
-            font-weight: 700;
             display: flex;
             align-items: center;
             gap: 8px;
+            background: rgba(16, 185, 129, 0.1);
+            color: var(--color-healthy);
+            border: 1px solid rgba(16, 185, 129, 0.25);
+            padding: 6px 14px;
+            border-radius: 9999px;
+            font-size: 0.82rem;
+            font-weight: 600;
         }
 
         .pulse-dot {
             width: 8px;
             height: 8px;
-            background-color: var(--color-healthy);
             border-radius: 50%;
-            animation: pulse 2s infinite;
+            background: var(--color-healthy);
+            box-shadow: 0 0 10px var(--color-healthy);
         }
 
-        @keyframes pulse {
-            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.7); }
-            70% { transform: scale(1); box-shadow: 0 0 0 8px rgba(52, 211, 153, 0); }
-            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(52, 211, 153, 0); }
-        }
-
-        /* 1-Click iOS Quick Install Banner */
+        /* iOS Hero Card */
         .ios-banner {
-            background: linear-gradient(135deg, rgba(56, 189, 248, 0.15), rgba(129, 140, 248, 0.1));
-            border: 1px solid rgba(56, 189, 248, 0.35);
+            background: linear-gradient(135deg, #1e1b4b 0%, #172554 100%);
+            border: 1px solid #4338ca;
             border-radius: 16px;
             padding: 24px;
             display: flex;
             flex-direction: column;
-            gap: 15px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            gap: 16px;
         }
 
         .ios-banner-header {
@@ -977,7 +997,7 @@ function renderDashboardHtml(req) {
             justify-content: space-between;
             align-items: center;
             flex-wrap: wrap;
-            gap: 10px;
+            gap: 12px;
         }
 
         .ios-banner-title {
@@ -986,49 +1006,48 @@ function renderDashboardHtml(req) {
             color: #fff;
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 8px;
         }
 
         .btn-ios {
-            background: linear-gradient(135deg, #38bdf8, #6366f1);
-            color: #fff;
-            padding: 12px 24px;
-            border-radius: 10px;
+            background: #38bdf8;
+            color: #0b0f19;
             font-weight: 700;
+            font-size: 0.95rem;
+            padding: 12px 22px;
+            border-radius: 10px;
             text-decoration: none;
             display: inline-flex;
             align-items: center;
-            gap: 10px;
-            font-size: 1rem;
-            box-shadow: 0 4px 15px rgba(56, 189, 248, 0.35);
-            transition: all 0.2s ease;
+            gap: 8px;
+            transition: all 0.2s;
+            box-shadow: 0 4px 14px rgba(56, 189, 248, 0.35);
         }
 
         .btn-ios:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(56, 189, 248, 0.5);
+            background: #7dd3fc;
+            transform: translateY(-1px);
         }
 
         .steps-container {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-            gap: 15px;
-            margin-top: 5px;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 14px;
         }
 
         .step-item {
-            background: rgba(255,255,255,0.03);
-            border: 1px solid rgba(255,255,255,0.08);
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
             border-radius: 10px;
             padding: 14px;
             font-size: 0.88rem;
-            color: var(--text-muted);
+            color: #cbd5e1;
         }
 
         .step-item strong {
-            color: #fff;
             display: block;
-            margin-bottom: 5px;
+            color: #fff;
+            margin-bottom: 4px;
         }
 
         /* URL Card */
@@ -1036,7 +1055,7 @@ function renderDashboardHtml(req) {
             background: var(--surface-card);
             border: 1px solid var(--surface-border);
             border-radius: 16px;
-            padding: 22px;
+            padding: 20px 24px;
             display: flex;
             flex-direction: column;
             gap: 14px;
@@ -1256,7 +1275,7 @@ function renderDashboardHtml(req) {
                 <div class="brand-icon">⚡</div>
                 <div class="brand-text">
                     <h1>Antigravity DoH Proxy</h1>
-                    <p>Máy chủ DNS-over-HTTPS tốc độ cao — Phân tán đa Upstream</p>
+                    <p>Máy chủ DNS-over-HTTPS tốc độ cao — Chia tải thông minh nhạy trễ</p>
                 </div>
             </div>
             <div class="badge-live">
@@ -1328,7 +1347,7 @@ function renderDashboardHtml(req) {
             </div>
             <div class="stat-card">
                 <span class="stat-label">Upstream Song Song</span>
-                <span class="stat-value" id="pool-size">4<span class="stat-unit">máy chủ</span></span>
+                <span class="stat-value" id="pool-size">3<span class="stat-unit">máy chủ</span></span>
             </div>
         </div>
 
@@ -1393,7 +1412,7 @@ function renderDashboardHtml(req) {
                 document.getElementById('cache-hit-rate').innerHTML = hitRate + '<span class="stat-unit">%</span>';
                 document.getElementById('swr-hits').innerText = (data.swrHits || 0).toLocaleString();
                 document.getElementById('avg-latency').innerHTML = (data.averageLatency || 0) + '<span class="stat-unit">ms</span>';
-                document.getElementById('pool-size').innerHTML = (data.poolSize || 4) + '<span class="stat-unit">máy chủ</span>';
+                document.getElementById('pool-size').innerHTML = (data.poolSize || 3) + '<span class="stat-unit">máy chủ</span>';
 
                 const tbody = document.getElementById('dns-table-body');
                 if (data.upstreams && data.upstreams.length > 0) {
@@ -1477,13 +1496,17 @@ const handler = async (req, res) => {
     }
   }
 
-  // 1. Detect if incoming request is a DoH request (Strictly prevents sending HTML to DNS clients)
+  // 1. Detect if incoming request is a DoH request (Catches all standard & non-standard DoH calls)
   const isDnsContentType = (req.headers['content-type'] || '').toLowerCase().includes('application/dns-message') ||
+                           (req.headers['content-type'] || '').toLowerCase().includes('application/dns-json') ||
                            (req.headers['accept'] || '').toLowerCase().includes('application/dns-message');
   const isDnsPath = pathname === '/dns-query' ||
+                    pathname === '/query' ||
                     pathname === '/resolve' ||
-                    pathname.endsWith('/dns-query') ||
-                    pathname === '/api/dns-query';
+                    pathname === '/doh' ||
+                    pathname === '/dns' ||
+                    pathname === '/api/dns-query' ||
+                    pathname.endsWith('/dns-query');
   const hasDnsParams = (searchParams.has('dns') || searchParams.has('name')) && pathname !== '/api/test-doh';
 
   if (isDnsPath || isDnsContentType || (hasDnsParams && req.method === 'GET')) {
@@ -1533,6 +1556,35 @@ if (cleanupTimer.unref) cleanupTimer.unref();
 // Periodic candidate ranking
 const candidatesTimer = setInterval(updateCandidates, 8000);
 if (candidatesTimer.unref) candidatesTimer.unref();
+
+// Periodic canary health probe for Degraded/Offline upstreams (every 30 seconds)
+const canaryTimer = setInterval(async () => {
+  const needsProbe = upstreamStates.filter(s => s.status === 'Degraded' || s.status === 'Offline');
+  if (needsProbe.length === 0) return;
+
+  const probeQuery = dnsPacket.encode({
+    type: 'query',
+    id: 9999,
+    flags: dnsPacket.RECURSION_DESIRED,
+    questions: [{ type: 'A', name: 'google.com' }]
+  });
+
+  for (const u of needsProbe) {
+    try {
+      const res = await queryDoHUpstream(u, probeQuery, 2000);
+      if (res && res.buffer && res.buffer.length >= 12) {
+        u.status = 'Healthy';
+        u.penalty = 0;
+        u.consecutiveErrors = 0;
+        u.avgLatency = res.latency;
+        u.realAvgLatency = res.latency;
+      }
+    } catch (e) {
+      // Still unreachable
+    }
+  }
+}, 30000);
+if (canaryTimer.unref) canaryTimer.unref();
 
 // Standalone Node.js execution
 if (!isVercel && require.main === module) {

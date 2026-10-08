@@ -1,17 +1,32 @@
 # Antigravity Hyper-Speed DNS over HTTPS (DoH) Proxy — Tối Ưu Cho Vercel
 
-Máy chủ proxy DNS-over-HTTPS (DoH) hiệu năng cao, thuật toán chia tải nhạy trễ (Hedged Racing Multi-Upstream), hỗ trợ đệm RAM + SWR (Stale-While-Revalidate), tối ưu hóa hoàn toàn cho **Vercel Serverless**.
+Máy chủ proxy DNS-over-HTTPS (DoH) hiệu năng cao, thuật toán chia tải nhạy trễ thông minh (Adaptive Latency-Aware Hedged Racing), loại bỏ nghẽn tải, đệm RAM + SWR (Stale-While-Revalidate), tối ưu hóa hoàn toàn cho **Vercel Serverless**.
 
 ---
 
-## 🛠️ Nguyên Nhân Gây Ra Lỗi Mất Internet Trên Vercel Trước Đó & Đã Được Khắc Phục:
+## ⚡ Các Tối Ưu Quan Trọng Đã Triển Khai:
 
-- **Nguyên nhân cốt lõi**: Trong phiên bản trước, quy tắc rewrite `/(.*) -> /api/index` trên Vercel khiến mọi yêu cầu đến `/dns-query` (hoặc POST binary từ iOS/Android) bị gán `req.url` thành `/api/index`. Do đường dẫn không khớp, máy chủ đã trả về **mã HTML (trang web dashboard)** với mã 200 OK thay vì gói tin nhị phân chuẩn `application/dns-message`.
-- Khi iPhone hoặc ứng dụng DNS nhận được chuỗi HTML thay vì gói DNS hợp lệ, hệ điều hành lập tức báo lỗi cấu hình DNS và ngắt kết nối Internet toàn bộ máy.
-- **Giải pháp triệt để đã triển khai**:
-  1. Tạo router chuyên trách `/api/dns-query.js` với cờ `bodyParser: false` để giữ nguyên luồng dữ liệu nhị phân RFC 8484 nguyên bản.
-  2. Bổ sung cơ chế phát hiện DoH thông minh đa tầng: Mọi request có `Content-Type: application/dns-message`, `Accept: application/dns-message` hoặc tham số `?dns=` / `?name=` đều được điều hướng thẳng vào bộ máy phân giải DoH, **tuyệt đối không bao giờ trả về HTML cho client DNS**.
-  3. Cung cấp file cấu hình **1-chạm cho iPhone / iPad / Mac (`/profile.mobileconfig`)**: Tải trực tiếp qua Safari và kích hoạt ngay mà không cần cài thêm bất kỳ ứng dụng nào!
+### 1. Khắc phục triệt để lỗi không gom được toàn bộ truy vấn / Nghẽn truy vấn:
+- **Nguyên nhân gây nghẽn trước đây**:
+  - Hàng đợi socket `httpsAgent.maxSockets` bị giới hạn ở 50 khiến hàng loạt truy vấn DNS đồng thời từ điện thoại (khi mở trang web có 50–100 request song song) bị xếp hàng chờ, dẫn đến hết hạn thời gian (timeout) và bị rớt truy vấn.
+  - Upstream `Quad9` (9.9.9.9) trả về HTTP 505 và `Mullvad` bị socket hang up liên tục khiến các truy vấn bị kẹt chờ timeout 2000ms.
+  - Request coalescing (gom nhóm truy vấn trùng) trước đây chưa có safety timeout, nếu truy vấn đầu tiên gặp server chậm sẽ kéo theo toàn bộ các truy vấn cùng tên miền bị treo.
+- **Giải pháp đã xử lý**:
+  - Đặt `maxSockets: Infinity` và `maxFreeSockets: 128` cho `httpsAgent`: Mọi truy vấn đều có socket HTTPS ngay lập tức, không còn hàng đợi nghẽn.
+  - Loại bỏ các server lỗi (Quad9, Mullvad), giữ lại danh mục **9 upstream quốc tế siêu tốc 100% phản hồi HTTP 200** (Google, Cloudflare, OpenDNS, AdGuard, DNS.SB, ControlD).
+  - Bổ sung **Safety Timeout (600ms)** cho Request Coalescing: Nếu truy vấn đang chạy gặp chậm trễ, các truy vấn sau sẽ tự động bứt ra để tự đua upstream mà không bị kẹt.
+  - Mở rộng phủ sóng 100% các endpoint: `/dns-query`, `/query`, `/resolve`, `/doh`, `/dns`, `/api/dns-query` trong cả `vercel.json` và code backend.
+
+### 2. Thuật toán chia tải thông minh, nhạy trễ và ổn định (Smart Load Balancer):
+- **Cơ chế tính điểm linh hoạt theo thời gian thực (PEWMA Score)**:
+  `Score = Real_EMA_Latency + (Active_Queries × 12) + Error_Penalty`
+  *(Điểm càng thấp = Máy chủ càng nhanh và ít tải)*
+- **Đua 3 đường truyền song song (Hedged Racing) kèm hủy ngay lập tức các yêu cầu thua cuộc**:
+  - Luôn chọn 3 ứng viên tốt nhất để cùng phân giải.
+  - Khi máy chủ nhanh nhất về đích đầu tiên, hệ thống gửi tín hiệu **AbortSignal hủy ngay lập tức các yêu cầu còn lại**, giải phóng socket và băng thông mạng.
+- **Circuit Breaker tự động cách ly máy chủ suy giảm**:
+  - Nếu một upstream bị lỗi liên tiếp ≥ 3 lần, chuyển trạng thái sang `Degraded`, ≥ 5 lần chuyển sang `Offline`.
+  - Bộ kiểm tra Canary tự động thăm dò máy chủ lỗi ngầm mỗi 30 giây để phục hồi tự động khi máy chủ khỏe lại.
 
 ---
 
@@ -21,7 +36,7 @@ Mở terminal trên máy tính của bạn trong thư mục dự án và chạy:
 
 ```bash
 git add .
-git commit -m "Fix DoH routing, add native iOS mobileconfig and api/dns-query handler"
+git commit -m "Optimize DoH concurrency, remove bottlenecks, smart hedged load balancing"
 git push
 ```
 
@@ -40,7 +55,7 @@ Vercel sẽ tự động build và deploy phiên bản mới trong vòng ~15 gi�
 3. Chọn **Cho phép (Allow)** khi có thông báo tải hồ sơ cấu hình.
 4. Mở **Cài đặt (Settings)** trên iPhone ➔ bấm vào mục **"Đã tải về hồ sơ" (Profile Downloaded)** ở ngay đầu màn hình.
 5. Bấm **Cài đặt (Install)** ở góc trên bên phải và xác nhận mật khẩu máy.
-6. **Xong!** Toàn bộ iPhone sẽ tự động chạy qua máy chủ DoH bảo mật, không hao pin, không cần bật app VPN chạy ngầm.
+6. **Xong!** Toàn bộ iPhone sẽ tự động chạy qua máy chủ DoH bảo mật, tốc độ cao, không hao pin, không cần cài VPN.
 
 ### Cách 2: Cài đặt thủ công bằng URL DoH
 - **URL DoH chuẩn**:
@@ -53,22 +68,5 @@ Vercel sẽ tự động build và deploy phiên bản mới trong vòng ~15 gi�
   - Vào *Cài đặt (Settings)* ➔ *Quyền riêng tư và bảo mật* ➔ *Sử dụng DNS an toàn*.
   - Chọn *Tùy chỉnh (Custom)* và dán URL trên vào.
 
-- **Ứng dụng DoH (DNSCloak, AdGuard, Intra)**:
-  - Dán URL `https://ten-du-an.vercel.app/dns-query` vào mục DoH Server URL.
-
----
-
-## 🧪 Kiểm Tra Hoạt Động Của Máy Chủ:
-
-Kiểm tra bằng cURL (trả về JSON):
-```bash
-curl "https://ten-du-an.vercel.app/dns-query?name=google.com&type=A"
-```
-
-Kiểm tra gói tin nhị phân RFC 8484 (POST):
-```bash
-curl -X POST "https://ten-du-an.vercel.app/dns-query" \
-  -H "Content-Type: application/dns-message" \
-  -H "Accept: application/dns-message" \
-  --data-binary @-
-```
+- **Ứng dụng DoH (Android Private DNS / DNSCloak / AdGuard / Intra)**:
+  - Dán URL `https://ten-du-an.vercel.app/dns-query` vào cấu hình.

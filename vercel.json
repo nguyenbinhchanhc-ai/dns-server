@@ -6,7 +6,19 @@
       "destination": "/api/dns-query"
     },
     {
+      "source": "/query",
+      "destination": "/api/dns-query"
+    },
+    {
       "source": "/resolve",
+      "destination": "/api/dns-query"
+    },
+    {
+      "source": "/doh",
+      "destination": "/api/dns-query"
+    },
+    {
+      "source": "/dns",
       "destination": "/api/dns-query"
     },
     {
