@@ -88,6 +88,44 @@ async function runTests() {
     
     console.log('=> TEST 3: PASS');
 
+    // --- CA KIỂM THỬ 4: Xác minh Cơ chế Nhận diện Ngữ Cảnh & Điều Phối Thông Minh Từng Truy Vấn ---
+    console.log('\n[TEST 4]: Kiểm tra cơ chế nhận diện từng truy vấn một (Smart Query Classifier)...');
+    const cases = [
+      { domain: 'google.com', type: 'A', expected: 'Google Cloud & Media' },
+      { domain: 'github.com', type: 'A', expected: 'Edge CDN & Web' },
+      { domain: 'microsoft.com', type: 'A', expected: 'Hạ tầng Doanh nghiệp & Mail' },
+      { domain: 'apple.com', type: 'HTTPS', expected: 'HTTP/3 SVCB & ECH' },
+      { domain: 'crypto-miner-tracker.com', type: 'A', expected: 'An ninh & Lọc Mã Độc' },
+      { domain: 'shopee.vn', type: 'A', expected: 'Anycast Khu Vực (VN)' },
+      { domain: 'packages.dev', type: 'A', expected: 'Developer & DNSSEC Anycast' }
+    ];
+
+    for (const tc of cases) {
+      const dohTestRes = await fetch(`${url}/api/test-doh?name=${encodeURIComponent(tc.domain)}&type=${tc.type}`);
+      if (!dohTestRes.ok) throw new Error(`Test-doh request failed for ${tc.domain}`);
+      const dohData = await dohTestRes.json();
+      if (!dohData.intent || !dohData.intent.category) {
+        throw new Error(`Truy vấn ${tc.domain} không được nhận diện ngữ cảnh!`);
+      }
+      if (dohData.intent.category !== tc.expected) {
+        throw new Error(`Phân loại sai cho ${tc.domain}: nhận diện '${dohData.intent.category}', kỳ vọng '${tc.expected}'`);
+      }
+      console.log(`   * [Đã nhận diện] ${tc.domain} (${tc.type}) => Danh mục: '${dohData.intent.category}' | Lý do: ${dohData.intent.reason} (Trễ: ${dohData.latencyMs}ms)`);
+    }
+
+    // Kiểm tra Recent Queries trong /api/stats có lưu intent đầy đủ
+    const finalStatsRes = await fetch(`${url}/api/stats`);
+    const finalStats = await finalStatsRes.json();
+    if (!finalStats.recentQueries || finalStats.recentQueries.length === 0) {
+      throw new Error('Dòng recentQueries bị rỗng!');
+    }
+    const topQuery = finalStats.recentQueries[0];
+    if (!topQuery.intent || !topQuery.intent.category) {
+      throw new Error('Recent query không lưu intent metadata!');
+    }
+    console.log(`=> Nhật ký gần nhất: ${topQuery.domain} -> [${topQuery.intent.category}] bởi ${topQuery.upstreamName} (${topQuery.latency}ms)`);
+    console.log('=> TEST 4: PASS');
+
 
 
   } catch (err) {
