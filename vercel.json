@@ -46,6 +46,26 @@
       "destination": "/api/test-doh"
     },
     {
+      "source": "/api/stress-test",
+      "destination": "/api/stress-test"
+    },
+    {
+      "source": "/stress-test",
+      "destination": "/api/stress-test"
+    },
+    {
+      "source": "/ping",
+      "destination": "/api/ping"
+    },
+    {
+      "source": "/stats",
+      "destination": "/api/stats"
+    },
+    {
+      "source": "/stream",
+      "destination": "/api/stream"
+    },
+    {
       "source": "/(.*)",
       "destination": "/api/index?path=/$1"
     }
