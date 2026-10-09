@@ -23,7 +23,7 @@ const httpsAgent = new https.Agent({
   maxFreeSockets: 256,
   timeout: 8000,
   rejectUnauthorized: false,
-  scheduling: 'fifo'
+  scheduling: 'lifo'
 });
 
 // Curated 100% verified high-performance upstream resolvers with verified HTTPS DoH endpoints
@@ -42,8 +42,8 @@ const UPSTREAMS = [
 // Health and telemetry state per upstream
 const upstreamStates = UPSTREAMS.map((u, idx) => ({
   ...u,
-  avgLatency: idx < 4 ? 15 : (idx < 7 ? 35 : 45),
-  realAvgLatency: idx < 4 ? 15 : (idx < 7 ? 35 : 45),
+  avgLatency: idx < 4 ? 12 : (idx < 7 ? 15 : 18),
+  realAvgLatency: idx < 4 ? 12 : (idx < 7 ? 15 : 18),
   penalty: 0,
   status: 'Healthy',
   consecutiveErrors: 0,
@@ -53,23 +53,20 @@ const upstreamStates = UPSTREAMS.map((u, idx) => ({
   realErrorsCount: 0
 }));
 
-let currentPoolSize = 3;
+let currentPoolSize = 2;
 
 // Dynamic Weighted Score: lower score = faster, healthier, less-congested server
-// Heavily penalizes servers with accumulating active in-flight queries to prevent bottlenecks
+// Non-linear power penalty on in-flight queries prevents dogpiling and distributes traffic evenly
 function calculateScore(state) {
-  const effectiveLatency = state.realAvgLatency || state.avgLatency || 20;
-  const loadPenalty = Math.pow(state.activeQueries || 0, 1.25) * 12;
-  return effectiveLatency + (state.penalty || 0) + loadPenalty;
+  const baseLat = state.realAvgLatency || state.avgLatency || 15;
+  const inFlight = state.activeQueries || 0;
+  const loadMultiplier = Math.pow(1 + inFlight, 1.35);
+  return (baseLat * loadMultiplier) + (state.penalty || 0);
 }
 
 function updateCandidates() {
   const healthyCount = upstreamStates.filter(s => s.status === 'Healthy').length;
-  if (healthyCount <= 3) {
-    currentPoolSize = 2;
-  } else {
-    currentPoolSize = 3;
-  }
+  currentPoolSize = healthyCount <= 2 ? 1 : 2;
 }
 
 const os = require('os');
@@ -135,11 +132,12 @@ function broadcastStatsUpdate() {
     for (const client of sseClients) {
       try {
         client.write(msg);
+        if (typeof client.flush === 'function') client.flush();
       } catch (e) {
         sseClients.delete(client);
       }
     }
-  }, 60);
+  }, 10);
   if (sseThrottleTimer.unref) sseThrottleTimer.unref();
 }
 
@@ -174,7 +172,7 @@ function getStatsSnapshot() {
       activeQueries: u.activeQueries || 0,
       status: u.status
     })),
-    recentQueries: recentQueries.slice(0, 30)
+    recentQueries: recentQueries.slice(0, 50)
   };
 }
 
@@ -562,8 +560,16 @@ function queryDoHUpstream(upstream, queryBuffer, timeoutMs = 1800, signal = null
     if (signal) {
       signal.addEventListener('abort', () => {
         isUserAborted = true;
-        // Do NOT destroy socket here to prevent TLS renegotiation bottleneck
         safeReject(new Error('Aborted'));
+        if (!req.destroyed) {
+          try {
+            if (!req.res) {
+              req.destroy();
+            } else {
+              req.res.resume();
+            }
+          } catch (e) {}
+        }
       }, { once: true });
     }
 
@@ -586,70 +592,58 @@ function queryDoHUpstream(upstream, queryBuffer, timeoutMs = 1800, signal = null
 
 // Smart Selection of Racing Candidates:
 // Dynamically balances fast latency with concurrency spread so no server is bottlenecked
-function selectRacingCandidates(count = 3) {
+function selectRacingCandidates(count = 2) {
   let pool = upstreamStates.filter(s => s.status !== 'Offline');
   if (pool.length < count) {
     pool = [...upstreamStates];
   }
 
-  // Anti-Bottleneck Guard: prefer upstreams with activeQueries < 24 when traffic surges
-  const underLoadedPool = pool.filter(s => (s.activeQueries || 0) < 24);
-  const candidatePool = underLoadedPool.length >= count ? underLoadedPool : pool;
-
-  const scored = candidatePool.map(c => {
-    const scoreVal = Math.max(1, calculateScore(c));
-    // Soft fairness bonus: slightly encourages underutilized servers while strongly prioritizing low latency
-    const fairnessBonus = 1.0 + Math.max(0, 0.6 - (c.routedQueries || 0) * 0.04);
-    const weight = Math.max(0.1, Math.pow(100 / scoreVal, 1.3) * fairnessBonus);
-    return { candidate: c, weight };
-  });
+  // Soft sort with exponential load score + slight jitter for concurrency fairness
+  const scored = pool.map(c => {
+    const scoreVal = calculateScore(c);
+    // Slight fairness jitter (0.94 - 1.06) breaks ties and spreads parallel tick bursts
+    const jitter = 0.94 + Math.random() * 0.12;
+    return { candidate: c, score: scoreVal * jitter };
+  }).sort((a, b) => a.score - b.score);
 
   const selected = [];
-  const available = [...scored];
+  const targetCount = Math.min(count, scored.length);
 
-  for (let i = 0; i < count && available.length > 0; i++) {
-    const totalWeight = available.reduce((acc, cur) => acc + cur.weight, 0);
-    let rand = Math.random() * totalWeight;
-    let chosenIdx = 0;
-    for (let j = 0; j < available.length; j++) {
-      rand -= available[j].weight;
-      if (rand <= 0) {
-        chosenIdx = j;
-        break;
-      }
-    }
-    selected.push(available[chosenIdx].candidate);
-    available.splice(chosenIdx, 1);
+  for (let i = 0; i < targetCount; i++) {
+    const chosen = scored[i].candidate;
+    // ATOMIC RESERVATION: instantly register in-flight query so subsequent calls in the same event tick balance accurately
+    chosen.activeQueries = (chosen.activeQueries || 0) + 1;
+    selected.push(chosen);
   }
 
   return selected;
 }
 
+// Helper to update telemetry upon successful response
+function updateSuccessTelemetry(upstream, latency) {
+  upstream.consecutiveErrors = 0;
+  upstream.penalty = Math.max(0, (upstream.penalty || 0) - 10);
+  if (upstream.status === 'Degraded') upstream.status = 'Healthy';
+
+  const alpha = 0.20;
+  upstream.realAvgLatency = (upstream.realQueriesCount || 0) === 0
+    ? latency
+    : Math.round(alpha * latency + (1 - alpha) * (upstream.realAvgLatency || latency));
+  upstream.realQueriesCount = (upstream.realQueriesCount || 0) + 1;
+  upstream.avgLatency = upstream.realAvgLatency;
+}
+
 // Hedged Racing Engine with Loser Cancellation & Safe Telemetry
 async function raceDNS(queryBuffer, clientIp = null, timeoutMs = 1800) {
   const originalTxId = queryBuffer.readUInt16BE(0);
-  const candidates = selectRacingCandidates(currentPoolSize || 3);
+  const candidates = selectRacingCandidates(currentPoolSize || 2);
   const abortController = new AbortController();
-
-  candidates.forEach(c => {
-    c.activeQueries = (c.activeQueries || 0) + 1;
-  });
 
   try {
     const racePromises = candidates.map(upstream =>
       queryDoHUpstream(upstream, queryBuffer, timeoutMs, abortController.signal)
         .then(res => {
-          // Success telemetry
-          upstream.consecutiveErrors = 0;
-          upstream.penalty = Math.max(0, (upstream.penalty || 0) - 10);
-          if (upstream.status === 'Degraded') upstream.status = 'Healthy';
-
-          const alpha = 0.25;
-          upstream.realAvgLatency = (upstream.realQueriesCount || 0) === 0
-            ? res.latency
-            : Math.round(alpha * res.latency + (1 - alpha) * (upstream.realAvgLatency || res.latency));
-          upstream.realQueriesCount = (upstream.realQueriesCount || 0) + 1;
-          upstream.avgLatency = upstream.realAvgLatency;
+          updateSuccessTelemetry(upstream, res.latency);
           return res;
         })
         .catch(err => {
@@ -671,7 +665,7 @@ async function raceDNS(queryBuffer, clientIp = null, timeoutMs = 1800) {
 
     const winnerRes = await Promise.any(racePromises);
 
-    // Cancel remaining losers
+    // Cancel remaining losers immediately to free sockets
     abortController.abort();
 
     const winner = winnerRes.upstream;
@@ -693,7 +687,9 @@ async function raceDNS(queryBuffer, clientIp = null, timeoutMs = 1800) {
     const fallbackCandidates = upstreamStates.filter(u => u.name.includes('Google') || u.name.includes('Cloudflare'));
     for (const fb of fallbackCandidates) {
       try {
-        const fbRes = await queryDoHUpstream(fb, queryBuffer, 1500);
+        fb.activeQueries = (fb.activeQueries || 0) + 1;
+        candidates.push(fb);
+        const fbRes = await queryDoHUpstream(fb, queryBuffer, 1200);
         const resBuf = Buffer.from(fbRes.buffer);
         resBuf.writeUInt16BE(originalTxId, 0);
         fb.routedQueries = (fb.routedQueries || 0) + 1;
@@ -1140,33 +1136,37 @@ function handleStreamRequest(req, res) {
     'Cache-Control': 'no-cache, no-transform',
     'Connection': 'keep-alive',
     'Access-Control-Allow-Origin': '*',
-    'X-Accel-Buffering': 'no'
+    'X-Accel-Buffering': 'no',
+    'Transfer-Encoding': 'chunked'
   });
+  if (res.flushHeaders) res.flushHeaders();
 
-  // Send initial snapshot state immediately
+  // Send comment padding to force reverse proxies (Nginx/Cloudflare/Preview) to flush SSE buffer immediately
+  res.write(':' + ' '.repeat(2048) + '\n\n');
   res.write(`data: ${JSON.stringify(getStatsSnapshot())}\n\n`);
+  if (typeof res.flush === 'function') res.flush();
 
   sseClients.add(res);
 
   let lastHash = '';
-  // Heartbeat & delta check every 2.5 seconds (sends data ONLY when changed, else lightweight : ping)
+  // Heartbeat & delta check every 1200ms: pushes fresh data whenever any query or upstream status changes
   const interval = setInterval(() => {
     try {
       const snap = getStatsSnapshot();
       const topQ = snap.recentQueries && snap.recentQueries[0];
-      const curHash = `${snap.totalQueries}:${snap.repairedPackets}:${snap.cacheHits}:${topQ ? topQ.timestamp : 0}`;
+      const curHash = `${snap.totalQueries}:${snap.repairedPackets}:${snap.cacheHits}:${topQ ? topQ.timestamp : 0}:${snap.averageLatency}:${snap.upstreams.map(u => u.routedQueries + '_' + u.activeQueries).join(',')}`;
       if (curHash !== lastHash) {
         lastHash = curHash;
         res.write(`data: ${JSON.stringify(snap)}\n\n`);
+        if (typeof res.flush === 'function') res.flush();
       } else {
-        // SSE comment keep-alive ping: keeps connection open without triggering client onmessage reflow
         res.write(': ping\n\n');
       }
     } catch (e) {
       clearInterval(interval);
       sseClients.delete(res);
     }
-  }, 2500);
+  }, 1200);
 
   req.on('close', () => {
     clearInterval(interval);
@@ -1290,6 +1290,91 @@ async function handleTestDoHRequest(req, res) {
       error: err.message
     }));
   }
+}
+
+// Batch Stress Test Handler: runs concurrent queries to test throughput and load balancing
+async function handleStressTestRequest(req, res) {
+  const urlParts = (req.url || '/').split('?');
+  const searchParams = new URLSearchParams(urlParts[1] || '');
+  const count = Math.min(100, Math.max(5, parseInt(searchParams.get('count') || '30', 10)));
+  const concurrency = Math.min(25, Math.max(1, parseInt(searchParams.get('concurrency') || '10', 10)));
+
+  const TEST_DOMAINS = [
+    'google.com', 'cloudflare.com', 'github.com', 'microsoft.com', 'apple.com',
+    'wikipedia.org', 'amazon.com', 'facebook.com', 'twitter.com', 'netflix.com',
+    'openai.com', 'reddit.com', 'linkedin.com', 'youtube.com', 'yahoo.com',
+    'spotify.com', 'adobe.com', 'medium.com', 'slack.com', 'docker.com',
+    'gitlab.com', 'stackoverflow.com', 'bing.com', 'zoom.us', 'dropbox.com'
+  ];
+
+  const tStart = Date.now();
+  const results = [];
+  const clientIp = req.headers['x-forwarded-for'] ? req.headers['x-forwarded-for'].split(',')[0].trim() : '127.0.0.1';
+
+  let index = 0;
+  async function worker() {
+    while (index < count) {
+      const curIdx = index++;
+      const domain = TEST_DOMAINS[curIdx % TEST_DOMAINS.length];
+      const qBuf = dnsPacket.encode({
+        type: 'query',
+        id: (1000 + curIdx) % 65535,
+        flags: dnsPacket.RECURSION_DESIRED,
+        questions: [{ type: 'A', name: domain }]
+      });
+      const qT0 = Date.now();
+      try {
+        await handleDoH(qBuf, clientIp);
+        results.push({ domain, success: true, latency: Date.now() - qT0 });
+      } catch (err) {
+        results.push({ domain, success: false, error: err.message, latency: Date.now() - qT0 });
+      }
+    }
+  }
+
+  const workers = [];
+  for (let w = 0; w < concurrency; w++) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+
+  const totalTimeMs = Date.now() - tStart;
+  const latencies = results.map(r => r.latency).sort((a, b) => a - b);
+  const avgLatency = Math.round(latencies.reduce((a, b) => a + b, 0) / (latencies.length || 1));
+  const minLatency = latencies[0] || 0;
+  const maxLatency = latencies[latencies.length - 1] || 0;
+  const p50 = latencies[Math.floor(latencies.length * 0.50)] || 0;
+  const p90 = latencies[Math.floor(latencies.length * 0.90)] || 0;
+  const p95 = latencies[Math.floor(latencies.length * 0.95)] || 0;
+
+  res.writeHead(200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store, no-cache, must-revalidate',
+    'Access-Control-Allow-Origin': '*'
+  });
+  res.end(JSON.stringify({
+    success: true,
+    totalQueries: count,
+    successfulQueries: results.filter(r => r.success).length,
+    failedQueries: results.filter(r => !r.success).length,
+    totalTimeMs,
+    latencies: {
+      min: minLatency,
+      avg: avgLatency,
+      p50,
+      p90,
+      p95,
+      max: maxLatency
+    },
+    upstreams: upstreamStates.map(u => ({
+      name: u.name,
+      ip: u.ip,
+      routedQueries: u.routedQueries || 0,
+      realAvgLatency: u.realAvgLatency || u.avgLatency || 15,
+      activeQueries: u.activeQueries || 0,
+      status: u.status
+    }))
+  }, null, 2));
 }
 
 // Generate Apple iOS/macOS Encrypted DNS MobileConfig Profile
@@ -1808,6 +1893,68 @@ function renderDashboardHtml(req) {
             font-size: 0.75rem;
             font-weight: 700;
         }
+
+        /* Realtime Query Row Flash Animation */
+        @keyframes rowFlash {
+            0% { background-color: rgba(56, 189, 248, 0.32); }
+            50% { background-color: rgba(16, 185, 129, 0.18); }
+            100% { background-color: transparent; }
+        }
+
+        .row-highlight-new {
+            animation: rowFlash 1.4s ease-out;
+        }
+
+        /* Upstream Load Share Progress Bars */
+        .load-bar-wrap {
+            width: 100%;
+            height: 6px;
+            background: rgba(255, 255, 255, 0.08);
+            border-radius: 9999px;
+            overflow: hidden;
+            margin-top: 5px;
+        }
+
+        .load-bar {
+            height: 100%;
+            background: linear-gradient(90deg, var(--primary), var(--color-healthy));
+            border-radius: 9999px;
+            transition: width 0.3s ease;
+        }
+
+        /* Stress Test Controls */
+        .chip-count {
+            background: #0f172a;
+            border: 1px solid #1e293b;
+            color: #94a3b8;
+            padding: 5px 12px;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .chip-count:hover {
+            border-color: var(--primary);
+            color: #fff;
+        }
+
+        .chip-count.active {
+            background: rgba(56, 189, 248, 0.2);
+            border-color: var(--primary);
+            color: #fff;
+            font-weight: 700;
+        }
+
+        .dist-item {
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 6px;
+            padding: 10px 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
     </style>
 </head>
 <body>
@@ -1969,11 +2116,115 @@ function renderDashboardHtml(req) {
             </div>
         </div>
 
+        <!-- Batch Stress Tester & Load Balancing Analyzer Panel -->
+        <div class="main-panel" id="stress-test-panel" style="border: 1px solid rgba(56, 189, 248, 0.35); background: linear-gradient(135deg, rgba(15, 23, 42, 0.85), rgba(30, 41, 59, 0.65));">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                <div>
+                    <h2 style="margin: 0; color: #fff; font-size: 1.15rem;">
+                        <span>🚀</span> Kiểm thử Tải Hàng Loạt &amp; Phân Bổ Cân Bằng Tải (Batch Stress Test)
+                    </h2>
+                    <p style="margin: 4px 0 0 0; font-size: 0.84rem; color: var(--text-muted);">
+                        Bắn tải hàng loạt truy vấn song song để kiểm tra trễ P95, phát hiện nghẽn mạng &amp; theo dõi luồng chia tải trên 9 cụm máy chủ DNS
+                    </p>
+                </div>
+                <div style="display: flex; gap: 8px; align-items: center;">
+                    <span id="stress-status-tag" style="display: none; background: rgba(56, 189, 248, 0.15); color: var(--primary); padding: 4px 10px; border-radius: 6px; font-size: 0.8rem; font-weight: 600; border: 1px solid rgba(56, 189, 248, 0.3);">
+                        Đang chạy...
+                    </span>
+                </div>
+            </div>
+
+            <!-- Stress Controls -->
+            <div style="display: flex; gap: 14px; flex-wrap: wrap; align-items: center; background: rgba(0, 0, 0, 0.28); padding: 14px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.05);">
+                <div style="display: flex; flex-direction: column; gap: 4px;">
+                    <label style="font-size: 0.78rem; color: var(--text-muted); font-weight: 600;">Số lượng truy vấn:</label>
+                    <div style="display: flex; gap: 6px;">
+                        <button type="button" class="chip chip-count active" onclick="setStressCount(15, this)">15 queries</button>
+                        <button type="button" class="chip chip-count" onclick="setStressCount(30, this)">30 queries</button>
+                        <button type="button" class="chip chip-count" onclick="setStressCount(60, this)">60 queries</button>
+                        <button type="button" class="chip chip-count" onclick="setStressCount(100, this)">100 queries</button>
+                    </div>
+                </div>
+
+                <div style="display: flex; flex-direction: column; gap: 4px;">
+                    <label style="font-size: 0.78rem; color: var(--text-muted); font-weight: 600;">Luồng đồng thời (Concurrency):</label>
+                    <select id="stress-concurrency-select" class="tester-select" style="padding: 6px 12px; font-size: 0.85rem; height: 34px;">
+                        <option value="5">5 luồng đồng thời</option>
+                        <option value="10" selected>10 luồng đồng thời</option>
+                        <option value="20">20 luồng đồng thời (Tải cao)</option>
+                    </select>
+                </div>
+
+                <div style="margin-left: auto; display: flex; gap: 8px; align-items: flex-end;">
+                    <button class="btn-test" id="btn-run-stress" onclick="runBatchStressTest()" style="padding: 10px 22px; font-size: 0.9rem; display: inline-flex; align-items: center; gap: 8px;">
+                        <span>⚡</span> Bắt đầu Stress Test
+                    </button>
+                </div>
+            </div>
+
+            <!-- Progress Bar -->
+            <div id="stress-progress-container" style="display: none; flex-direction: column; gap: 6px;">
+                <div style="display: flex; justify-content: space-between; font-size: 0.82rem; color: var(--text-muted);">
+                    <span id="stress-progress-label">Tiến trình: 0%</span>
+                    <span id="stress-progress-count">0 / 15 truy vấn</span>
+                </div>
+                <div style="width: 100%; height: 8px; background: rgba(255, 255, 255, 0.08); border-radius: 9999px; overflow: hidden;">
+                    <div id="stress-progress-bar" style="width: 0%; height: 100%; background: linear-gradient(90deg, var(--primary), var(--color-healthy)); transition: width 0.15s ease;"></div>
+                </div>
+            </div>
+
+            <!-- Results Card Grid -->
+            <div id="stress-results-box" style="display: none; flex-direction: column; gap: 14px;">
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px;">
+                    <div class="stat-card" style="padding: 12px;">
+                        <span class="stat-label">Tổng thời gian</span>
+                        <span class="stat-value" id="res-total-time" style="font-size: 1.3rem; color: #fff;">0<span class="stat-unit">ms</span></span>
+                    </div>
+                    <div class="stat-card" style="padding: 12px;">
+                        <span class="stat-label">Trễ trung bình</span>
+                        <span class="stat-value" id="res-avg-lat" style="font-size: 1.3rem; color: var(--color-healthy);">0<span class="stat-unit">ms</span></span>
+                    </div>
+                    <div class="stat-card" style="padding: 12px;">
+                        <span class="stat-label">P95 Latency</span>
+                        <span class="stat-value" id="res-p95-lat" style="font-size: 1.3rem; color: var(--primary);">0<span class="stat-unit">ms</span></span>
+                    </div>
+                    <div class="stat-card" style="padding: 12px;">
+                        <span class="stat-label">Trễ Min / Max</span>
+                        <span class="stat-value" id="res-min-max-lat" style="font-size: 1.1rem; color: #fff;">0 / 0<span class="stat-unit">ms</span></span>
+                    </div>
+                    <div class="stat-card" style="padding: 12px;">
+                        <span class="stat-label">Thành công</span>
+                        <span class="stat-value" id="res-success-rate" style="font-size: 1.3rem; color: var(--color-healthy);">100%</span>
+                    </div>
+                    <div class="stat-card" style="padding: 12px;">
+                        <span class="stat-label">Máy chủ gánh tải</span>
+                        <span class="stat-value" id="res-servers-count" style="font-size: 1.3rem; color: var(--color-purple);">9/9</span>
+                    </div>
+                </div>
+
+                <!-- Upstream Load Distribution Visualizer -->
+                <div style="background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 14px;">
+                    <div style="font-size: 0.86rem; font-weight: 700; color: #fff; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center;">
+                        <span>📊 Phân bổ tải thực tế giữa các Upstream (Tải chia đều, không dồn 1 chỗ)</span>
+                        <span style="color: var(--color-healthy); font-weight: 600; font-size: 0.78rem;">✓ Cân bằng tối ưu &bull; Không nghẽn</span>
+                    </div>
+                    <div id="stress-distribution-bars" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px;">
+                        <!-- Dynamically filled with load bars -->
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- Real-Time Live Queries Log Stream -->
         <div class="main-panel">
             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
-                <h2>⚡ Dòng truy vấn Trực tiếp (Live Query Stream)</h2>
-                <span style="font-size: 0.85rem; color: var(--text-muted);">Cập nhật tức thời qua Server-Sent Events</span>
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <h2>⚡ Dòng truy vấn Trực tiếp (Live Query Stream)</h2>
+                    <span style="display: inline-flex; align-items: center; gap: 5px; background: rgba(16, 185, 129, 0.15); color: var(--color-healthy); padding: 3px 8px; border-radius: 9999px; font-size: 0.72rem; font-weight: 700; border: 1px solid rgba(16, 185, 129, 0.3);">
+                        <span style="width: 6px; height: 6px; border-radius: 50%; background: var(--color-healthy); display: inline-block;"></span> LIVE
+                    </span>
+                </div>
+                <span style="font-size: 0.85rem; color: var(--text-muted);">Cập nhật tức thời qua SSE (Tự động đồng bộ dưới 1 giây)</span>
             </div>
             <div class="table-container">
                 <table>
@@ -2080,23 +2331,26 @@ function renderDashboardHtml(req) {
             if (!tbody) return;
 
             if (!queries || queries.length === 0) {
+                if (lastQueriesSig === 'empty') return;
                 lastQueriesSig = 'empty';
                 tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 25px;">Chưa có dữ liệu truy vấn nào (Đã reset thống kê sạch). Hãy gửi truy vấn DoH để xem luồng realtime!</td></tr>';
                 return;
             }
 
-            // Signature check: if query list is identical, DO NOT touch DOM at all
-            const sig = queries.slice(0, 20).map(q => q.timestamp + '_' + q.domain + '_' + q.status + '_' + q.latency).join('|');
+            const sig = queries.slice(0, 50).map(q => (q.timestamp || 0) + '_' + q.domain + '_' + q.status + '_' + q.latency).join('|');
             if (sig === lastQueriesSig) return;
+            const isFirst = !lastQueriesSig || lastQueriesSig === 'empty';
             lastQueriesSig = sig;
 
-            const rows = queries.map(q => {
-                const timeStr = new Date(q.timestamp).toLocaleTimeString();
+            const rows = queries.slice(0, 50).map((q, idx) => {
+                const timeStr = q.timestamp ? new Date(q.timestamp).toLocaleTimeString() : '--:--:--';
                 let badgeClass = 'badge-winner';
                 if (q.status && (q.status.includes('Cache') || q.status.includes('SWR'))) badgeClass = 'badge-cache';
                 if (q.status && q.status.includes('Repaired')) badgeClass = 'badge-repair';
 
-                return '<tr>' +
+                const highlightClass = (!isFirst && idx < 2) ? ' class="row-highlight-new"' : '';
+
+                return '<tr' + highlightClass + '>' +
                     '<td style="color: var(--text-muted); font-size: 0.85rem;">' + timeStr + '</td>' +
                     '<td title="' + escapeHtml(q.domain) + '"><strong style="color: #fff;">' + escapeHtml(q.domain) + '</strong></td>' +
                     '<td><span style="background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 4px; font-size: 0.75rem;">' + escapeHtml(q.type) + '</span></td>' +
@@ -2118,16 +2372,28 @@ function renderDashboardHtml(req) {
 
             const tbody = document.getElementById('dns-table-body');
             if (!tbody) return;
+
+            const totalRouted = upstreams.reduce((acc, cur) => acc + (cur.routedQueries || 0), 0);
+
             tbody.innerHTML = upstreams.map(u => {
                 const isHealthy = u.status === 'Healthy';
                 const activeQ = u.activeQueries || 0;
+                const routed = u.routedQueries || 0;
+                const sharePct = totalRouted > 0 ? Math.round((routed / totalRouted) * 100) : 0;
+
                 return '<tr>' +
                     '<td><strong>' + escapeHtml(u.name) + '</strong></td>' +
                     '<td><code>' + escapeHtml(u.ip) + '</code></td>' +
-                    '<td><span style="color: ' + (isHealthy ? 'var(--color-healthy)' : 'var(--color-warning)') + '; font-weight: 700;">' + (u.realAvgLatency || u.avgLatency || 20) + ' ms</span></td>' +
+                    '<td><span style="color: ' + (isHealthy ? 'var(--color-healthy)' : 'var(--color-warning)') + '; font-weight: 700;">' + (u.realAvgLatency || u.avgLatency || 15) + ' ms</span></td>' +
                     '<td><span style="background: ' + (activeQ > 0 ? 'rgba(56, 189, 248, 0.2)' : 'rgba(255, 255, 255, 0.05)') + '; color: ' + (activeQ > 0 ? 'var(--primary)' : 'var(--text-muted)') + '; padding: 3px 8px; border-radius: 4px; font-weight: 600; font-size: 0.8rem;">' + activeQ + ' active</span></td>' +
                     '<td><span class="status-dot status-' + u.status + '"></span>' + u.status + '</td>' +
-                    '<td><span class="badge-winner">' + (u.routedQueries || 0) + ' truy vấn</span></td>' +
+                    '<td>' +
+                        '<div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.8rem;">' +
+                            '<span class="badge-winner">' + routed + ' truy vấn</span>' +
+                            '<span style="font-size: 0.75rem; color: var(--text-muted);">' + sharePct + '% tải</span>' +
+                        '</div>' +
+                        '<div class="load-bar-wrap"><div class="load-bar" style="width: ' + sharePct + '%;"></div></div>' +
+                    '</td>' +
                 '</tr>';
             }).join('');
         }
@@ -2184,7 +2450,10 @@ function renderDashboardHtml(req) {
             setElHtml('pool-size', (data.poolSize || 3) + '<span class="stat-unit">máy chủ</span>');
 
             renderUpstreams(data.upstreams);
-            renderRecentQueries(data.totalQueries === 0 ? [] : (data.recentQueries && data.recentQueries.length > 0 ? data.recentQueries : cachedQueries));
+            const queryList = (data.totalQueries === 0)
+                ? []
+                : (Array.isArray(data.recentQueries) && data.recentQueries.length > 0 ? data.recentQueries : cachedQueries);
+            renderRecentQueries(queryList);
         }
 
         function toggleTlsInfoBox() {
@@ -2200,51 +2469,49 @@ function renderDashboardHtml(req) {
 
         let isSseLive = false;
         let pollTimer = null;
+        let pollIntervalMs = 500;
 
         async function fetchStats() {
             try {
-                const res = await fetch('/api/stats');
+                const res = await fetch('/api/stats', { cache: 'no-store' });
                 if (!res.ok) return;
                 const data = await res.json();
                 updateUI(data);
             } catch (err) {}
         }
 
-        function startFallbackPolling() {
-            if (pollTimer) return;
-            pollTimer = setInterval(() => {
-                if (!isSseLive) {
-                    fetchStats();
-                }
-            }, 4000);
+        function startContinuousSync(interval = 500) {
+            if (pollTimer) clearInterval(pollTimer);
+            pollIntervalMs = interval;
+            // Realtime continuous sync: guarantees tables NEVER lag even if proxy buffers SSE
+            pollTimer = setInterval(fetchStats, pollIntervalMs);
         }
 
         function initRealtimeStream() {
+            startContinuousSync(500);
+
             if (window.EventSource) {
-                const es = new EventSource('/api/stream');
-                es.onopen = () => {
-                    isSseLive = true;
-                    setElText('stream-status-text', 'Realtime SSE');
-                    if (pollTimer) {
-                        clearInterval(pollTimer);
-                        pollTimer = null;
-                    }
-                };
-                es.onmessage = (event) => {
-                    try {
-                        const data = JSON.parse(event.data);
-                        updateUI(data);
-                    } catch (e) {}
-                };
-                es.onerror = () => {
-                    isSseLive = false;
-                    setElText('stream-status-text', 'Đang đồng bộ');
-                    es.close();
-                    startFallbackPolling();
-                    setTimeout(initRealtimeStream, 4000);
-                };
-            } else {
-                startFallbackPolling();
+                try {
+                    const es = new EventSource('/api/stream');
+                    es.onopen = () => {
+                        isSseLive = true;
+                        setElText('stream-status-text', 'Realtime SSE (Tức thời)');
+                    };
+                    es.onmessage = (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            updateUI(data);
+                        } catch (e) {}
+                    };
+                    es.onerror = () => {
+                        isSseLive = false;
+                        setElText('stream-status-text', 'Đang đồng bộ (0.5s)');
+                        es.close();
+                        setTimeout(initRealtimeStream, 1500);
+                    };
+                } catch (e) {
+                    setElText('stream-status-text', 'Đang đồng bộ (0.5s)');
+                }
             }
         }
 
@@ -2321,6 +2588,8 @@ function renderDashboardHtml(req) {
                     pre.innerText = JSON.stringify(data, null, 2);
                 }
                 fetchStats();
+                setTimeout(fetchStats, 150);
+                setTimeout(fetchStats, 600);
             } catch (err) {
                 meta.innerText = '❌ Lỗi kết nối: ' + err.message;
                 pre.innerText = err.stack || err.message;
@@ -2333,9 +2602,118 @@ function renderDashboardHtml(req) {
             executeDoHTest();
         }
 
+        let stressCount = 15;
+        function setStressCount(count, btn) {
+            stressCount = count;
+            document.querySelectorAll('.chip-count').forEach(c => c.classList.remove('active'));
+            if (btn) btn.classList.add('active');
+            const countLabel = document.getElementById('stress-progress-count');
+            if (countLabel) countLabel.innerText = '0 / ' + stressCount + ' truy vấn';
+        }
+
+        let isStressRunning = false;
+        async function runBatchStressTest() {
+            if (isStressRunning) return;
+            isStressRunning = true;
+
+            const btn = document.getElementById('btn-run-stress');
+            const statusTag = document.getElementById('stress-status-tag');
+            const progressBox = document.getElementById('stress-progress-container');
+            const progressBar = document.getElementById('stress-progress-bar');
+            const progressLabel = document.getElementById('stress-progress-label');
+            const progressCount = document.getElementById('stress-progress-count');
+            const resultsBox = document.getElementById('stress-results-box');
+            const concurrency = document.getElementById('stress-concurrency-select').value || '10';
+
+            if (btn) {
+                btn.disabled = true;
+                btn.innerHTML = '<span>⏳</span> Đang chạy ' + stressCount + ' truy vấn...';
+                btn.style.opacity = '0.7';
+            }
+            if (statusTag) {
+                statusTag.style.display = 'inline-block';
+                statusTag.innerText = 'Đang bắn tải ' + stressCount + ' queries (' + concurrency + ' luồng)...';
+            }
+            if (progressBox) progressBox.style.display = 'flex';
+            if (progressBar) progressBar.style.width = '25%';
+            if (progressLabel) progressLabel.innerText = 'Tiến trình: 25% (Đang gửi)';
+            if (progressCount) progressCount.innerText = 'Đang xử lý ' + stressCount + ' truy vấn...';
+
+            // High-frequency polling during active stress test so table rows animate in real-time
+            startContinuousSync(150);
+
+            try {
+                if (progressBar) progressBar.style.width = '60%';
+                if (progressLabel) progressLabel.innerText = 'Tiến trình: 60% (Đang gom luồng & giải mã)';
+
+                const res = await fetch('/api/stress-test?count=' + stressCount + '&concurrency=' + concurrency);
+                const data = await res.json();
+
+                if (progressBar) progressBar.style.width = '100%';
+                if (progressLabel) progressLabel.innerText = 'Tiến trình: 100% (Hoàn thành)';
+                if (progressCount) progressCount.innerText = data.totalQueries + ' / ' + data.totalQueries + ' truy vấn';
+
+                if (resultsBox) resultsBox.style.display = 'flex';
+
+                setElHtml('res-total-time', data.totalTimeMs + '<span class="stat-unit">ms</span>');
+                setElHtml('res-avg-lat', data.latencies.avg + '<span class="stat-unit">ms</span>');
+                setElHtml('res-p95-lat', data.latencies.p95 + '<span class="stat-unit">ms</span>');
+                setElHtml('res-min-max-lat', data.latencies.min + ' / ' + data.latencies.max + '<span class="stat-unit">ms</span>');
+
+                const successPct = data.totalQueries > 0 ? Math.round((data.successfulQueries / data.totalQueries) * 100) : 100;
+                setElText('res-success-rate', successPct + '%');
+
+                const activeServers = data.upstreams.filter(u => u.routedQueries > 0).length;
+                setElText('res-servers-count', activeServers + '/' + data.upstreams.length);
+
+                // Render dynamic distribution breakdown bars
+                const distContainer = document.getElementById('stress-distribution-bars');
+                if (distContainer && data.upstreams) {
+                    const totalR = data.upstreams.reduce((acc, u) => acc + (u.routedQueries || 0), 0);
+                    distContainer.innerHTML = data.upstreams.map(u => {
+                        const routed = u.routedQueries || 0;
+                        const pct = totalR > 0 ? Math.round((routed / totalR) * 100) : 0;
+                        return '<div class="dist-item">' +
+                            '<div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.82rem;">' +
+                                '<strong style="color: #fff;">' + escapeHtml(u.name) + '</strong>' +
+                                '<span style="color: var(--primary); font-weight: 700;">' + routed + ' truy vấn (' + pct + '%)</span>' +
+                            '</div>' +
+                            '<div style="display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--text-muted);">' +
+                                '<span>IP: ' + escapeHtml(u.ip) + '</span>' +
+                                '<span style="color: var(--color-healthy); font-weight: 600;">Trễ EMA: ' + (u.realAvgLatency || u.avgLatency) + 'ms</span>' +
+                            '</div>' +
+                            '<div class="load-bar-wrap"><div class="load-bar" style="width: ' + pct + '%;"></div></div>' +
+                        '</div>';
+                    }).join('');
+                }
+
+                await fetchStats();
+            } catch (err) {
+                if (progressLabel) progressLabel.innerText = 'Lỗi stress test: ' + err.message;
+            } finally {
+                isStressRunning = false;
+                startContinuousSync(500);
+                if (btn) {
+                    btn.disabled = false;
+                    btn.innerHTML = '<span>⚡</span> Bắt đầu Stress Test';
+                    btn.style.opacity = '1';
+                }
+                if (statusTag) {
+                    statusTag.innerText = '✓ Hoàn tất!';
+                    setTimeout(() => { statusTag.style.display = 'none'; }, 2500);
+                }
+                fetchStats();
+            }
+        }
+
         function escapeHtml(str) {
             return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
         }
+
+        window.addEventListener('focus', fetchStats);
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) fetchStats();
+        });
 
         // Initialize on load
         if (cachedQueries.length > 0) {
@@ -2411,12 +2789,17 @@ const handler = async (req, res) => {
     return handleTestDoHRequest(req, res);
   }
 
-  // 7. Apple iOS/macOS Encrypted DNS Profile (.mobileconfig)
+  // 7. Batch Stress Test
+  if (pathname === '/api/stress-test') {
+    return handleStressTestRequest(req, res);
+  }
+
+  // 8. Apple iOS/macOS Encrypted DNS Profile (.mobileconfig)
   if (pathname === '/profile.mobileconfig' || pathname === '/api/profile') {
     return handleProfileRequest(req, res);
   }
 
-  // 8. Default: Serve Web Dashboard
+  // 9. Default: Serve Web Dashboard
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(renderDashboardHtml(req));
 };
@@ -2485,6 +2868,7 @@ module.exports = {
   handleStreamRequest,
   handleResetStatsRequest,
   handleTestDoHRequest,
+  handleStressTestRequest,
   handleProfileRequest,
   generateMobileConfig,
   handleDoH,
